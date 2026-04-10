@@ -199,6 +199,15 @@ class RiotClient:
         # block inside a single poll.
         self._poll_lock = threading.Lock()
 
+        # F5: sticky memory of the most recent active player we fired
+        # on_role_mismatch for. While this matches the current active
+        # player's summoner name, repeat polls short-circuit without
+        # re-firing the callback (or even cycling the FSM). Cleared on:
+        #   - ACTIVE → ENDING transition (game actually ended)
+        #   - 10s of no-response while in IDLE (user returned to lobby)
+        #   - A successful jungle-role transition (user changed role)
+        self._role_mismatch_summoner: str | None = None
+
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._poll_interval_s = config.poll_interval_ms / 1000.0
@@ -332,11 +341,25 @@ class RiotClient:
         if self._no_response_since is None:
             self._no_response_since = now
         elapsed = now - self._no_response_since
-        if (
-            self._state == LifecycleState.ACTIVE
-            and elapsed >= NO_RESPONSE_ENDING_THRESHOLD_S
-        ):
+        if elapsed < NO_RESPONSE_ENDING_THRESHOLD_S:
+            return
+        if self._state == LifecycleState.ACTIVE:
             self._end_current_game("timeout")
+            return
+        if (
+            self._state == LifecycleState.IDLE
+            and self._role_mismatch_summoner is not None
+        ):
+            # 10s+ of no-response while paused on a role mismatch means the
+            # game ended from the client's view (user returned to lobby or
+            # alt-tabbed away). Clear the memory so the next 200 re-evaluates
+            # fresh. Reset the no-response window so we don't re-trigger on
+            # every subsequent 404.
+            logger.info(
+                "clearing role-mismatch memory after no-response timeout"
+            )
+            self._role_mismatch_summoner = None
+            self._no_response_since = None
 
     def _handle_game_data(self, data: dict[str, Any]) -> None:
         # Successful 200 clears the no-response window.
@@ -345,6 +368,16 @@ class RiotClient:
         game_time = self._extract_game_time(data)
 
         if self._state == LifecycleState.IDLE:
+            # F5: if we've already notified about a role mismatch for this
+            # active player, don't re-cycle IDLE → STARTING → IDLE and
+            # don't re-fire the callback. Suppression is keyed on summoner
+            # name so a DIFFERENT active player triggers a fresh evaluation.
+            if self._role_mismatch_summoner is not None:
+                active_summoner = (data.get("activePlayer") or {}).get(
+                    "summonerName"
+                )
+                if active_summoner == self._role_mismatch_summoner:
+                    return
             self._start_game(data, game_time)
             return
 
@@ -378,8 +411,14 @@ class RiotClient:
         if not _is_jungle_role(player):
             role = _extract_role(player)
             self._callbacks.on_role_mismatch(role)
+            # F5: remember which summoner we notified about so repeat polls
+            # for the same game don't re-fire the callback.
+            self._role_mismatch_summoner = player.get("summonerName")
             self._transition(LifecycleState.IDLE, f"role mismatch: {role}")
             return
+        # Valid jungle role — clear any stale role-mismatch memory (user
+        # may have swapped from a mismatch game to a fresh jungle game).
+        self._role_mismatch_summoner = None
         self._last_game_time = game_time
         self._transition(LifecycleState.ACTIVE, "role verified as jungle")
         self._callbacks.on_game_data(data)
@@ -389,6 +428,11 @@ class RiotClient:
         self._callbacks.on_game_end(reason)
         self._last_game_time = None
         self._no_response_since = None
+        # Defensive: if the sticky role-mismatch memory was somehow set
+        # while in ACTIVE, clear it on game end. Normal flow never sets
+        # the flag while in ACTIVE, but this guarantees new games get a
+        # fresh evaluation regardless of how we reached ENDING.
+        self._role_mismatch_summoner = None
         self._transition(LifecycleState.IDLE, "cleanup complete")
 
     @staticmethod

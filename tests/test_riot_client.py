@@ -594,3 +594,156 @@ def test_riot_client_rejects_missing_host() -> None:
     config = RiotApiConfig(base_url="not-a-url")
     with pytest.raises(ValueError, match="base_url"):
         RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+
+
+# ---------------------------------------------------------------------------
+# F5 regression: on_role_mismatch fires exactly once per game
+# ---------------------------------------------------------------------------
+def _make_top_lane_fixture() -> dict:
+    """Helper: return the ingame fixture with the active player's role
+    changed to TOP (and summoner spells replaced so the Smite fallback
+    doesn't rescue it).
+    """
+    data = _load_fixture("allgamedata_ingame.json")
+    for p in data["allPlayers"]:
+        if p["summonerName"] == data["activePlayer"]["summonerName"]:
+            p["position"] = "TOP"
+            p["summonerSpells"]["summonerSpellOne"]["displayName"] = "Teleport"
+            p["summonerSpells"]["summonerSpellTwo"]["displayName"] = "Flash"
+            break
+    return data
+
+
+def test_role_mismatch_fires_exactly_once_across_repeat_polls() -> None:
+    """Plan line 460 explicitly requires 'fires exactly once'. Before the
+    sticky flag, every 2s poll while stuck in IDLE after a role mismatch
+    re-entered _start_game and re-fired on_role_mismatch. In Phase 2
+    that would be audible TTS spam every 2s for the entire game.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data = _make_top_lane_fixture()
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()  # first mismatch
+        client.poll_once()  # repeat 1 — must NOT fire
+        client.poll_once()  # repeat 2
+        client.poll_once()  # repeat 3
+
+    assert spy.role_mismatches == ["TOP"], (
+        f"on_role_mismatch must fire exactly once across repeat polls, "
+        f"got {spy.role_mismatches}"
+    )
+    assert client.state == LifecycleState.IDLE
+
+
+def test_role_mismatch_resets_after_no_response_timeout() -> None:
+    """A 10s no-response window while paused on a role mismatch means
+    the game ended (or the user alt-tabbed to the lobby). Clear the
+    sticky memory so the next 200 re-evaluates as a fresh game.
+
+    Discriminating assertion: before the 10s 404, a repeat poll must NOT
+    fire on_role_mismatch (sticky blocks it). After the 10s 404, a fresh
+    poll MUST fire it again (memory cleared). Without both assertions the
+    test would pass vacuously against the current buggy implementation.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data = _make_top_lane_fixture()
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()  # fires TOP
+        client.poll_once()  # sticky — must NOT re-fire
+    # The discriminator: broken code gets ["TOP", "TOP"] here; fix gets ["TOP"].
+    assert spy.role_mismatches == ["TOP"]
+
+    # Simulate 12s of 404 (game ended from client view).
+    base = client._now()
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, status_code=404)
+        client._clock_override = lambda: base + 0.5
+        client.poll_once()
+        client._clock_override = lambda: base + 12.0
+        client.poll_once()
+    client._clock_override = None
+
+    # The user's next game is also top lane — should fire AGAIN for the
+    # new game (the memory cleared after the no-response window).
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()
+
+    assert spy.role_mismatches == ["TOP", "TOP"], (
+        f"after 10s no-response, next game's role mismatch should fire "
+        f"fresh; got {spy.role_mismatches}"
+    )
+
+
+def test_role_mismatch_does_not_reset_on_brief_404() -> None:
+    """A single 404 within the no-response window (transient network
+    blip) should NOT clear the sticky flag. Only after the 10s
+    threshold elapses does the flag clear.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data = _make_top_lane_fixture()
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()
+    assert spy.role_mismatches == ["TOP"]
+
+    # 5s of 404 — under the 10s threshold.
+    base = client._now()
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, status_code=404)
+        client._clock_override = lambda: base + 0.5
+        client.poll_once()
+        client._clock_override = lambda: base + 5.0
+        client.poll_once()
+    client._clock_override = None
+
+    # Next 200 with same mismatch should NOT re-fire the callback.
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()
+
+    assert spy.role_mismatches == ["TOP"], (
+        f"sticky flag must survive a brief 404 window, got {spy.role_mismatches}"
+    )
+
+
+def test_role_mismatch_memory_tracks_summoner_not_just_a_boolean() -> None:
+    """If the active player changes (e.g., a different user logs in on
+    the same machine, or a test harness injects a different player), the
+    sticky memory must re-evaluate rather than short-circuit based on an
+    unrelated stale state.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data_a = _make_top_lane_fixture()  # ActivePlayer#NA1 playing TOP
+
+    # Build a "different user" fixture: swap the active player's summoner
+    # name to DifferentUser#NA1 and also update the matching entry.
+    data_b = _make_top_lane_fixture()
+    data_b["activePlayer"]["summonerName"] = "DifferentUser#NA1"
+    for p in data_b["allPlayers"]:
+        if p["summonerName"] == "ActivePlayer#NA1":
+            p["summonerName"] = "DifferentUser#NA1"
+            break
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data_a)
+        client.poll_once()  # fires TOP for ActivePlayer#NA1
+    assert spy.role_mismatches == ["TOP"]
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data_b)
+        client.poll_once()  # different summoner — should fire fresh
+
+    assert spy.role_mismatches == ["TOP", "TOP"], (
+        f"different active player should re-evaluate, "
+        f"got {spy.role_mismatches}"
+    )
