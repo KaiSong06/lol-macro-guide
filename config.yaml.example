@@ -1,0 +1,36 @@
+# lolcoach configuration example.
+# Copy this file to `config.yaml` next to the executable and edit as needed.
+# Every field shown here is the default — remove any field you do not want to override.
+
+capture:
+  interval_ms: 500
+  minimap_roi: auto  # or [x, y, w, h] for manual override; "auto" uses calibration.json
+
+riot_api:
+  poll_interval_ms: 2000
+  base_url: https://127.0.0.1:2999
+
+inference:
+  # Verify exact Ollama vision model tag at implementation time.
+  # Candidates: gemma3:4b, gemma3:12b, minicpm-v, qwen2.5vl:7b
+  model: gemma3:4b
+  timeout_ms: 10000
+  ollama_host: http://localhost:11434
+  keep_alive: -1  # pin the model in VRAM; prevents Ollama from unloading mid-game
+
+decisions:
+  cooldown_seconds: 5
+  confidence_threshold: 6  # drop callouts below this (1-10 scale)
+  dedup_window_seconds: 30  # suppress same (category, target_lane) within window
+  staleness_threshold_seconds: 10  # drop inference results older than this
+
+tts:
+  voice: en_US-amy-medium
+  speed: 1.0
+  output_device: system_default  # or a specific device name
+  interrupt_confidence_delta: 2  # new callout needs this much higher confidence to interrupt
+  interrupt_categories: [gank_warning, counter_gank]  # only these categories can interrupt
+
+logging:
+  level: INFO
+  directory: ./logs
