@@ -142,15 +142,26 @@ class Detector:
     ) -> DetectionResult:
         """Run template matching against *frame* and return grounded detections.
 
-        Champions whose templates aren't loaded, whose matches are below the
-        confidence threshold, or whose names are in neither ally nor enemy
-        rosters are dropped. NMS collapses overlapping hits per champion.
+        Only templates whose names are in ``ally_names ∪ enemy_names`` are
+        matched — the roster filter runs BEFORE the matchTemplate loop, not
+        after. For a typical League match (10 players) against a ~160-champ
+        template library, this is a ~16x speedup on the capture hot path.
+        Champions whose templates aren't loaded are silently skipped (e.g.,
+        a brand-new champion released after the last
+        ``build-champion-templates.py`` run).
         """
         ally_set = set(ally_names)
         enemy_set = set(enemy_names)
+        roster = ally_set | enemy_set
 
         raw_hits_by_name: dict[str, list[dict[str, float | int]]] = {}
-        for name, template in self._templates.items():
+        for name in roster:
+            template = self._templates.get(name)
+            if template is None:
+                # Roster contains a champion we don't have a template for
+                # (probably a new release). Skip silently — logging every
+                # missing template on every 500ms capture tick would flood.
+                continue
             hits = self._match_template(frame, template)
             if hits:
                 raw_hits_by_name[name] = hits
@@ -158,17 +169,7 @@ class Detector:
         detections: list[ChampionDetection] = []
         frame_h, frame_w = frame.shape[:2]
         for name, hits in raw_hits_by_name.items():
-            if name in ally_set:
-                team = "ally"
-            elif name in enemy_set:
-                team = "enemy"
-            else:
-                logger.info(
-                    "detector dropping unknown champion %r not in any roster",
-                    name,
-                )
-                continue
-
+            team = "ally" if name in ally_set else "enemy"
             for hit in _nms(hits, self._nms_iou_threshold):
                 cx = float(hit["x"]) + float(hit["w"]) / 2.0
                 cy = float(hit["y"]) + float(hit["h"]) / 2.0
