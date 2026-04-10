@@ -1,0 +1,110 @@
+{
+  "activePlayer": {
+    "summonerName": "ActivePlayer#NA1",
+    "level": 8,
+    "currentGold": 3200,
+    "championStats": {
+      "healthMax": 1500,
+      "abilityPower": 0,
+      "attackDamage": 120
+    }
+  },
+  "allPlayers": [
+    {
+      "summonerName": "ActivePlayer#NA1",
+      "championName": "Hecarim",
+      "rawChampionName": "game_character_displayname_Hecarim",
+      "level": 8,
+      "position": "JUNGLE",
+      "team": "ORDER",
+      "isBot": false,
+      "isDead": false,
+      "respawnTimer": 0.0,
+      "items": [],
+      "summonerSpells": {
+        "summonerSpellOne": {"displayName": "Smite"},
+        "summonerSpellTwo": {"displayName": "Flash"}
+      },
+      "scores": {"kills": 2, "deaths": 0, "assists": 1, "creepScore": 40, "wardScore": 5.0}
+    },
+    {
+      "summonerName": "Ally1#NA1",
+      "championName": "Jinx",
+      "level": 9,
+      "position": "BOTTOM",
+      "team": "ORDER",
+      "isBot": false,
+      "isDead": false,
+      "respawnTimer": 0.0,
+      "items": [],
+      "summonerSpells": {
+        "summonerSpellOne": {"displayName": "Flash"},
+        "summonerSpellTwo": {"displayName": "Heal"}
+      },
+      "scores": {"kills": 3, "deaths": 1, "assists": 2, "creepScore": 80, "wardScore": 3.0}
+    },
+    {
+      "summonerName": "Ally2#NA1",
+      "championName": "Ahri",
+      "level": 9,
+      "position": "MIDDLE",
+      "team": "ORDER",
+      "isBot": false,
+      "isDead": false,
+      "respawnTimer": 0.0,
+      "items": [],
+      "summonerSpells": {
+        "summonerSpellOne": {"displayName": "Flash"},
+        "summonerSpellTwo": {"displayName": "Ignite"}
+      },
+      "scores": {"kills": 1, "deaths": 0, "assists": 3, "creepScore": 85, "wardScore": 4.0}
+    },
+    {
+      "summonerName": "Enemy1#NA1",
+      "championName": "LeeSin",
+      "rawChampionName": "game_character_displayname_LeeSin",
+      "level": 7,
+      "position": "JUNGLE",
+      "team": "CHAOS",
+      "isBot": false,
+      "isDead": false,
+      "respawnTimer": 0.0,
+      "items": [],
+      "summonerSpells": {
+        "summonerSpellOne": {"displayName": "Smite"},
+        "summonerSpellTwo": {"displayName": "Flash"}
+      },
+      "scores": {"kills": 1, "deaths": 2, "assists": 1, "creepScore": 35, "wardScore": 4.0}
+    },
+    {
+      "summonerName": "Enemy2#NA1",
+      "championName": "Ekko",
+      "level": 8,
+      "position": "MIDDLE",
+      "team": "CHAOS",
+      "isBot": false,
+      "isDead": false,
+      "respawnTimer": 0.0,
+      "items": [],
+      "summonerSpells": {
+        "summonerSpellOne": {"displayName": "Flash"},
+        "summonerSpellTwo": {"displayName": "Ignite"}
+      },
+      "scores": {"kills": 2, "deaths": 1, "assists": 0, "creepScore": 75, "wardScore": 3.0}
+    }
+  ],
+  "events": {
+    "Events": [
+      {"EventID": 0, "EventName": "GameStart", "EventTime": 0.028},
+      {"EventID": 1, "EventName": "MinionsSpawning", "EventTime": 65.0},
+      {"EventID": 2, "EventName": "ChampionKill", "EventTime": 540.0, "KillerName": "Enemy1#NA1", "VictimName": "Ally1#NA1"}
+    ]
+  },
+  "gameData": {
+    "gameMode": "CLASSIC",
+    "gameTime": 742.5,
+    "mapName": "Map11",
+    "mapNumber": 11,
+    "mapTerrain": "Default"
+  }
+}

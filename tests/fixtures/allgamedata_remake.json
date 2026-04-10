@@ -1,0 +1,37 @@
+{
+  "activePlayer": {
+    "summonerName": "ActivePlayer#NA1",
+    "level": 1,
+    "currentGold": 500
+  },
+  "allPlayers": [
+    {
+      "summonerName": "ActivePlayer#NA1",
+      "championName": "Hecarim",
+      "level": 1,
+      "position": "JUNGLE",
+      "team": "ORDER",
+      "isBot": false,
+      "isDead": false,
+      "respawnTimer": 0.0,
+      "items": [],
+      "summonerSpells": {
+        "summonerSpellOne": {"displayName": "Smite"},
+        "summonerSpellTwo": {"displayName": "Flash"}
+      },
+      "scores": {"kills": 0, "deaths": 0, "assists": 0, "creepScore": 0, "wardScore": 0.0}
+    }
+  ],
+  "events": {
+    "Events": [
+      {"EventID": 0, "EventName": "GameStart", "EventTime": 0.028}
+    ]
+  },
+  "gameData": {
+    "gameMode": "CLASSIC",
+    "gameTime": 2.5,
+    "mapName": "Map11",
+    "mapNumber": 11,
+    "mapTerrain": "Default"
+  }
+}
