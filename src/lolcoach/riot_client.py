@@ -208,6 +208,12 @@ class RiotClient:
         #   - A successful jungle-role transition (user changed role)
         self._role_mismatch_summoner: str | None = None
 
+        # F14: throttle flag for the "malformed payload" warning. Set
+        # when we see a 200 response we can't parse an active player out
+        # of; cleared when a valid payload arrives. Without this, a bad
+        # payload storm would log a warning on every 2s poll.
+        self._malformed_payload_warned: bool = False
+
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._poll_interval_s = config.poll_interval_ms / 1000.0
@@ -362,7 +368,26 @@ class RiotClient:
             self._no_response_since = None
 
     def _handle_game_data(self, data: dict[str, Any]) -> None:
-        # Successful 200 clears the no-response window.
+        # F14: pre-validate the payload. A 200 response that we can't
+        # resolve an active player out of (missing activePlayer, missing
+        # allPlayers, summoner name not found) is indistinguishable from
+        # a 404 for our purposes — treat it as no-response so the FSM
+        # doesn't cycle IDLE → STARTING → IDLE on every poll. This also
+        # prevents a malformed payload's gameTime from being mistaken
+        # for a "new game started" reset while in ACTIVE state.
+        if _find_active_player_entry(data) is None:
+            if not self._malformed_payload_warned:
+                logger.warning(
+                    "200 response with missing/malformed activePlayer — "
+                    "treating as no-response until a valid payload arrives"
+                )
+                self._malformed_payload_warned = True
+            self._handle_no_response()
+            return
+
+        # Valid payload — clear the malformed-throttle and the
+        # no-response window.
+        self._malformed_payload_warned = False
         self._no_response_since = None
 
         game_time = self._extract_game_time(data)
