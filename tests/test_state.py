@@ -195,6 +195,88 @@ def test_reset_clears_everything() -> None:
     assert snap.kill_feed == ()
 
 
+def test_update_from_riot_dedupes_events_by_id() -> None:
+    """Riot's Live Client Data API returns the cumulative event history on
+    every poll. The StateManager must not re-process the same ChampionKill
+    events repeatedly, or the kill_feed fills with duplicates and (worse)
+    enemy_jungler_last_seen gets permanently wiped after the first enemy
+    jungler death.
+    """
+    sm = StateManager()
+    data = _load_fixture("allgamedata_ingame.json")
+    # The fixture has 2 ChampionKill events (EventID 2 and 3).
+    expected_kills = [
+        e for e in data["events"]["Events"] if e["EventName"] == "ChampionKill"
+    ]
+    assert len(expected_kills) == 2, "fixture should have 2 ChampionKill events"
+
+    sm.update_from_riot(data)
+    assert len(sm.snapshot().kill_feed) == 2
+
+    # Poll the same fixture twice more. No new events — kill_feed must not grow.
+    sm.update_from_riot(data)
+    assert len(sm.snapshot().kill_feed) == 2
+
+    sm.update_from_riot(data)
+    assert len(sm.snapshot().kill_feed) == 2
+
+
+def test_enemy_jungler_kill_only_clears_last_seen_once() -> None:
+    """The regression test for F1. The fixture's EventID=3 event is
+    'Ally2#NA1 kills Enemy1#NA1' — Enemy1#NA1 is the enemy jungler.
+    Before the EventID dedup fix, every repeat poll re-matched this event
+    against self._enemy_jungler_summoner_name and re-cleared last_seen.
+    """
+    import time as _time
+
+    sm = StateManager()
+    data = _load_fixture("allgamedata_ingame.json")
+    sm.update_from_riot(data)  # processes both kills; last_seen was None
+
+    # Detector sees the jungler (as if they respawned and walked back to jungle)
+    sm.update_from_detector(
+        DetectionResult(
+            champions=(
+                ChampionDetection(
+                    name="LeeSin",
+                    team="enemy",
+                    position_norm=(0.5, 0.5),
+                    quadrant="bot_jungle",
+                    confidence=0.9,
+                ),
+            ),
+            detected_at=_time.time(),
+        )
+    )
+    assert sm.snapshot().enemy_jungler_last_seen is not None
+
+    # Every subsequent Riot poll carries the same historical kill event.
+    # Without EventID dedup, _append_kill_locked re-matches VictimName and
+    # re-clears last_seen on every poll. With dedup, last_seen survives.
+    sm.update_from_riot(data)
+    sm.update_from_riot(data)
+    sm.update_from_riot(data)
+
+    assert sm.snapshot().enemy_jungler_last_seen is not None
+
+
+def test_reset_clears_processed_event_ids() -> None:
+    """reset() must also clear the event-id high-water mark so a new game's
+    events are processed correctly (Riot resets EventIDs per game).
+    """
+    sm = StateManager()
+    data = _load_fixture("allgamedata_ingame.json")
+    sm.update_from_riot(data)
+    assert len(sm.snapshot().kill_feed) == 2
+
+    sm.reset()
+
+    # After reset, polling the same events again should re-process them
+    # (they look like fresh events from a new game).
+    sm.update_from_riot(data)
+    assert len(sm.snapshot().kill_feed) == 2
+
+
 def test_update_from_riot_preserves_detector_last_seen() -> None:
     sm = StateManager()
     sm.update_from_riot(_load_fixture("allgamedata_ingame.json"))

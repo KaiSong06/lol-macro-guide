@@ -80,6 +80,11 @@ class StateManager:
         self._kill_feed: deque[dict[str, Any]] = deque(maxlen=KILL_FEED_MAX)
         self._riot_events: list[dict[str, Any]] = []
         self._raw_riot_data: dict[str, Any] | None = None
+        # EventID high-water mark: Riot's Live Client Data API returns the
+        # cumulative event history on every poll, so we must track which
+        # events we've already processed or every repeat poll will re-fire
+        # the same ChampionKill and corrupt state (F1 regression).
+        self._processed_event_ids: set[int] = set()
 
     # ------------------------------------------------------------------
     # Public updates
@@ -139,8 +144,23 @@ class StateManager:
 
             events = (data.get("events") or {}).get("Events") or []
             self._riot_events = list(events)
-            # Append new kill events to the bounded kill feed.
+            # Riot returns the full cumulative event history on every poll.
+            # Skip any event whose EventID we've already seen — otherwise
+            # every ChampionKill re-fires on every poll, corrupting
+            # kill_feed with duplicates and permanently wiping
+            # enemy_jungler_last_seen after the first enemy jungler death.
             for ev in events:
+                event_id = ev.get("EventID")
+                if not isinstance(event_id, int):
+                    # Missing/non-int EventID shouldn't happen, but fall
+                    # back to a per-call replay rather than crashing —
+                    # better to over-log than to silently drop.
+                    if ev.get("EventName") == "ChampionKill":
+                        self._append_kill_locked(ev)
+                    continue
+                if event_id in self._processed_event_ids:
+                    continue
+                self._processed_event_ids.add(event_id)
                 if ev.get("EventName") == "ChampionKill":
                     self._append_kill_locked(ev)
 
@@ -178,6 +198,7 @@ class StateManager:
             self._kill_feed.clear()
             self._riot_events = []
             self._raw_riot_data = None
+            self._processed_event_ids.clear()
 
     def snapshot(self) -> GameState:
         """Return an immutable deep-copy snapshot of the current state.

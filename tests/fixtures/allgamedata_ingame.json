@@ -97,7 +97,8 @@
     "Events": [
       {"EventID": 0, "EventName": "GameStart", "EventTime": 0.028},
       {"EventID": 1, "EventName": "MinionsSpawning", "EventTime": 65.0},
-      {"EventID": 2, "EventName": "ChampionKill", "EventTime": 540.0, "KillerName": "Enemy1#NA1", "VictimName": "Ally1#NA1"}
+      {"EventID": 2, "EventName": "ChampionKill", "EventTime": 540.0, "KillerName": "Enemy1#NA1", "VictimName": "Ally1#NA1"},
+      {"EventID": 3, "EventName": "ChampionKill", "EventTime": 620.0, "KillerName": "Ally2#NA1", "VictimName": "Enemy1#NA1"}
     ]
   },
   "gameData": {
