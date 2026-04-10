@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lolcoach"
+version = "0.1.0.dev0"
+description = "Real-time vision-grounded jungle coach for League of Legends"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "KaiSong06" }]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.10",
+    "requests>=2.32",
+    "urllib3>=2.2",
+    "PyYAML>=6.0",
+    "dxcam>=0.0.5; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "requests-mock>=1.12",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+lolcoach = "lolcoach.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src/lolcoach --cov-fail-under=90 --cov-report=term-missing -q"
+pythonpath = ["src"]
+
+[tool.coverage.run]
+source = ["src/lolcoach"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+.installed.cfg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Type checkers and linters
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Runtime artifacts
+logs/
+calibration.json
+config.yaml
+# Keep config.yaml.example tracked
+!config.yaml.example
+
+# Champion templates (user data, downloaded at runtime)
+~/.lolcoach/
+src/lolcoach/assets/champion-templates/*.png
+# Keep the assets/ directory placeholder
+!src/lolcoach/assets/.gitkeep
+!src/lolcoach/assets/champion-templates/.gitkeep
+
+# PyInstaller build outputs
+build/
+dist/
+*.spec.bak
+
+# Bundled binaries (downloaded manually for release builds)
+scripts/binaries/piper/*
+scripts/binaries/voices/*
+!scripts/binaries/piper/.gitkeep
+!scripts/binaries/voices/.gitkeep
+
+# OS
+Thumbs.db
+.DS_Store
