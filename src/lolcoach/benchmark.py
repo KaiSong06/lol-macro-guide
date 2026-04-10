@@ -23,7 +23,7 @@ import json
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -71,11 +71,30 @@ def compute_stats(samples: list[float]) -> dict[str, float]:
 # ---------------------------------------------------------------------------
 # Benchmark result
 # ---------------------------------------------------------------------------
-@dataclass
+@dataclass(frozen=True)
 class BenchmarkResult:
+    """Latency benchmark summary.
+
+    Failure modes are tracked in three distinct buckets so the Week 1
+    decision tree in the spec can distinguish between "Ollama is slow",
+    "Ollama crashed mid-benchmark", and "Ollama is returning HTTP errors":
+
+    * ``timeout_count`` — ``requests.Timeout`` raised by the session
+    * ``connection_error_count`` — ``requests.ConnectionError`` raised
+      *after* the first successful or timeout response (the first
+      ConnectionError bubbles up so ``main()`` can exit 1 with a
+      "Ollama unreachable" message)
+    * ``http_error_count`` — the session returned a non-200 status code
+
+    All three are mutually exclusive and excluded from ``stats`` (which
+    only contains successful samples).
+    """
+
     stats: dict[str, float]
     timeout_count: int = 0
-    samples: list[float] = field(default_factory=list)
+    connection_error_count: int = 0
+    http_error_count: int = 0
+    samples: tuple[float, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +123,8 @@ def run_benchmark(
 
     samples: list[float] = []
     timeouts = 0
+    connection_errors = 0
+    http_errors = 0
 
     payload_template = {
         "model": model,
@@ -127,15 +148,23 @@ def run_benchmark(
                 timeouts += 1
                 continue
             except requests.ConnectionError:
-                # If we never connect at all, bubble up so main() can exit.
+                # Bubble the FIRST connection error so main() can exit with
+                # a helpful "Ollama unreachable" message. Subsequent
+                # connection errors mid-run (server crashed) count as
+                # connection errors, NOT timeouts — the old implementation
+                # silently lumped them into timeout_count and hid the
+                # failure mode from the Week 1 decision tree.
                 if i == 0 and not samples:
                     raise
-                timeouts += 1
+                connection_errors += 1
                 continue
 
             elapsed = time.perf_counter() - start
             if resp.status_code != 200:
-                # Treat as a failure (not a timeout) — exclude from stats.
+                # Non-200 is a distinct failure from timeouts — track
+                # separately so the developer can see "10 calls
+                # succeeded, 5 returned HTTP 503" in the report.
+                http_errors += 1
                 continue
             samples.append(elapsed)
     finally:
@@ -145,7 +174,9 @@ def run_benchmark(
     return BenchmarkResult(
         stats=compute_stats(samples),
         timeout_count=timeouts,
-        samples=samples,
+        connection_error_count=connection_errors,
+        http_error_count=http_errors,
+        samples=tuple(samples),
     )
 
 
@@ -234,19 +265,24 @@ def main(argv: list[str] | None = None) -> int:
         "benchmark_summary",
         count=stats["count"],
         timeout_count=result.timeout_count,
+        connection_error_count=result.connection_error_count,
+        http_error_count=result.http_error_count,
         min=stats["min"],
         max=stats["max"],
         mean=stats["mean"],
         p50=stats["p50"],
         p95=stats["p95"],
-        samples=result.samples,
+        samples=list(result.samples),
     )
 
     print(
         "Benchmark summary — count={count} timeouts={timeouts} "
+        "conn_errors={conn_errors} http_errors={http_errors} "
         "min={min:.2f}s mean={mean:.2f}s p50={p50:.2f}s p95={p95:.2f}s max={max:.2f}s".format(
             count=int(stats["count"]),
             timeouts=result.timeout_count,
+            conn_errors=result.connection_error_count,
+            http_errors=result.http_error_count,
             min=stats["min"],
             mean=stats["mean"],
             p50=stats["p50"],
@@ -254,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
             max=stats["max"],
         )
     )
+    print(f"Wrote benchmark log: {output_path}", file=sys.stderr)
     return 0
 
 

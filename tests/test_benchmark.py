@@ -85,9 +85,11 @@ def test_run_benchmark_happy_path(tmp_path: Path) -> None:
 
     assert isinstance(result, BenchmarkResult)
     assert result.timeout_count == 0
+    assert result.connection_error_count == 0
+    assert result.http_error_count == 0
     assert result.stats["count"] == 5
-    assert result.samples is not None
     assert len(result.samples) == 5
+    assert isinstance(result.samples, tuple)
 
 
 def test_run_benchmark_with_timeouts(tmp_path: Path) -> None:
@@ -115,7 +117,81 @@ def test_run_benchmark_with_timeouts(tmp_path: Path) -> None:
         )
 
     assert result.timeout_count == 2
+    assert result.connection_error_count == 0
+    assert result.http_error_count == 0
     assert result.stats["count"] == 3  # 5 - 2 = 3 successful samples
+
+
+def test_run_benchmark_counts_http_errors_separately_from_timeouts(
+    tmp_path: Path,
+) -> None:
+    """Non-200 responses are a distinct failure mode from timeouts. The
+    benchmark must track them separately so the Week 1 decision tree
+    can distinguish "Ollama is slow" (timeouts) from "Ollama returned
+    HTTP 503" (server side errors).
+    """
+    fixture = tmp_path / "frame.png"
+    fixture.write_bytes(b"pngbytes")
+
+    call_counter = {"n": 0}
+
+    def response_callback(request, context):
+        call_counter["n"] += 1
+        if call_counter["n"] in (2, 4):
+            context.status_code = 503
+            return {"error": "service unavailable"}
+        context.status_code = 200
+        return {"message": {"content": "ok"}}
+
+    with rm_module.Mocker() as m:
+        m.post(OLLAMA_URL, json=response_callback)
+        result = run_benchmark(
+            ollama_url=OLLAMA_URL,
+            model="fake-model",
+            fixture_path=fixture,
+            n=5,
+            prompt="test",
+        )
+
+    assert result.timeout_count == 0
+    assert result.connection_error_count == 0
+    assert result.http_error_count == 2
+    assert result.stats["count"] == 3
+
+
+def test_run_benchmark_counts_mid_run_connection_errors(tmp_path: Path) -> None:
+    """If Ollama crashes mid-benchmark, subsequent calls raise
+    ConnectionError. These must count as connection_error_count, NOT
+    timeout_count — the old implementation lumped them together and
+    hid the crash under "slow" in the Week 1 gate.
+    """
+    fixture = tmp_path / "frame.png"
+    fixture.write_bytes(b"pngbytes")
+
+    call_counter = {"n": 0}
+
+    def response_callback(request, context):
+        call_counter["n"] += 1
+        if call_counter["n"] >= 3:
+            raise requests.ConnectionError("crashed mid-run")
+        context.status_code = 200
+        return {"message": {"content": "ok"}}
+
+    with rm_module.Mocker() as m:
+        m.post(OLLAMA_URL, json=response_callback)
+        result = run_benchmark(
+            ollama_url=OLLAMA_URL,
+            model="fake-model",
+            fixture_path=fixture,
+            n=5,
+            prompt="test",
+        )
+
+    # First 2 calls succeed, then 3 ConnectionErrors
+    assert result.stats["count"] == 2
+    assert result.timeout_count == 0
+    assert result.connection_error_count == 3
+    assert result.http_error_count == 0
 
 
 def test_run_benchmark_raises_connection_error(tmp_path: Path) -> None:
@@ -163,6 +239,10 @@ def test_main_happy_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     captured = capsys.readouterr()
     assert "Benchmark summary" in captured.out
     assert "count=3" in captured.out
+    assert "conn_errors=0" in captured.out
+    assert "http_errors=0" in captured.out
+    # The JSONL path is echoed to stderr so agents don't have to glob.
+    assert "Wrote benchmark log:" in captured.err
 
     # A JSONL file was written under the log dir.
     jsonl_files = list(log_dir.glob("benchmark-*.jsonl"))
@@ -171,6 +251,8 @@ def test_main_happy_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> 
     lines = jsonl_files[0].read_text().strip().splitlines()
     assert len(lines) >= 1
     summary = json.loads(lines[-1])
+    assert summary["connection_error_count"] == 0
+    assert summary["http_error_count"] == 0
     assert summary["type"] == "benchmark_summary"
     assert summary["count"] == 3
 
