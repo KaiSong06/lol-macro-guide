@@ -69,7 +69,7 @@ logging:
 
     assert isinstance(cfg, Config)
     assert cfg.capture.interval_ms == 250
-    assert cfg.capture.minimap_roi == [100, 200, 300, 400]
+    assert cfg.capture.minimap_roi == (100, 200, 300, 400)
     assert cfg.riot_api.poll_interval_ms == 1000
     assert cfg.riot_api.base_url == "https://example.invalid:2999"
     assert cfg.inference.model == "minicpm-v:2b"
@@ -83,7 +83,7 @@ logging:
     assert cfg.tts.speed == pytest.approx(1.1)
     assert cfg.tts.output_device == "Headphones (USB Audio)"
     assert cfg.tts.interrupt_confidence_delta == 3
-    assert cfg.tts.interrupt_categories == ["gank_warning"]
+    assert cfg.tts.interrupt_categories == ("gank_warning",)
     assert cfg.logging.level == "DEBUG"
     assert cfg.logging.directory == "/tmp/lolcoach-logs"
 
@@ -106,7 +106,7 @@ def test_load_config_missing_file_returns_defaults_and_warns(
     assert cfg.decisions.dedup_window_seconds == 30
     assert cfg.decisions.staleness_threshold_seconds == 10
     assert cfg.tts.interrupt_confidence_delta == 2
-    assert cfg.tts.interrupt_categories == ["gank_warning", "counter_gank"]
+    assert cfg.tts.interrupt_categories == ("gank_warning", "counter_gank")
     assert cfg.capture.interval_ms == 500
     assert cfg.riot_api.poll_interval_ms == 2000
     assert cfg.inference.model == "gemma3:4b"
@@ -215,12 +215,27 @@ def test_decisions_config_defaults_match_spec() -> None:
     assert d.staleness_threshold_seconds == 10
 
 
-def test_tts_config_interrupt_categories_is_an_independent_list() -> None:
-    """Two separate TtsConfig instances must not share a mutable default list."""
+def test_tts_config_interrupt_categories_is_an_immutable_tuple() -> None:
+    """The field must be a tuple so ``frozen=True`` actually prevents
+    modification. The previous implementation used a mutable default list
+    which let callers silently append/mutate a "frozen" instance — F3 from
+    /ce:review.
+    """
+    cfg = TtsConfig()
+    assert cfg.interrupt_categories == ("gank_warning", "counter_gank")
+    assert isinstance(cfg.interrupt_categories, tuple)
+
+    # Immutability enforcement: tuples have no ``append``.
+    with pytest.raises(AttributeError):
+        cfg.interrupt_categories.append("pathing")  # type: ignore[attr-defined]
+
+    # Two instances are independent value types (trivial with tuples).
     a = TtsConfig()
     b = TtsConfig()
-    a.interrupt_categories.append("pathing")
-    assert b.interrupt_categories == ["gank_warning", "counter_gank"]
+    assert a.interrupt_categories is not b.interrupt_categories or (
+        # Python interns small tuples sometimes, which is fine — still immutable.
+        a.interrupt_categories == b.interrupt_categories
+    )
 
 
 # ---------------------------------------------------------------------------

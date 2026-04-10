@@ -34,7 +34,11 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class CaptureConfig:
     interval_ms: int = 500
-    minimap_roi: str | list[int] = "auto"
+    #: Either the sentinel ``"auto"`` (use calibration.json) or a
+    #: ``(x, y, w, h)`` tuple. Tuples are immutable so they're safe to
+    #: carry on a frozen dataclass. YAML lists are coerced to tuples
+    #: during config loading.
+    minimap_roi: str | tuple[int, int, int, int] = "auto"
 
 
 @dataclass(frozen=True)
@@ -65,9 +69,10 @@ class TtsConfig:
     speed: float = 1.0
     output_device: str = "system_default"
     interrupt_confidence_delta: int = 2
-    interrupt_categories: list[str] = field(
-        default_factory=lambda: ["gank_warning", "counter_gank"]
-    )
+    #: Immutable tuple — ``frozen=True`` on the dataclass doesn't protect
+    #: a list field from in-place mutation, so we use a tuple instead.
+    #: YAML lists are coerced to tuples during config loading.
+    interrupt_categories: tuple[str, ...] = ("gank_warning", "counter_gank")
 
 
 @dataclass(frozen=True)
@@ -163,6 +168,17 @@ def _build_config(raw: dict[str, Any], path: Path) -> Config:
     return Config(**sections)
 
 
+#: Field names that must be coerced from YAML list -> tuple before being
+#: passed to the frozen dataclass constructor. YAML has no tuple primitive,
+#: so users write lists; we enforce immutability at the dataclass boundary.
+_LIST_TO_TUPLE_FIELDS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("capture", "minimap_roi"),
+        ("tts", "interrupt_categories"),
+    }
+)
+
+
 def _build_section(
     klass: type,
     sub: dict[str, Any],
@@ -180,5 +196,7 @@ def _build_section(
                 section_name,
             )
             continue
+        if (section_name, key) in _LIST_TO_TUPLE_FIELDS and isinstance(value, list):
+            value = tuple(value)
         kwargs[key] = value
     return klass(**kwargs)
