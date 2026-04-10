@@ -51,27 +51,50 @@ def save_calibration(path: Path, roi: ROI) -> None:
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m lolcoach.calibrate",
-        description="Calibrate the League minimap region for lolcoach.",
+        description=(
+            "Calibrate the League minimap region for lolcoach. Writes a "
+            "calibration.json file that capture.py loads to know which "
+            "region of the screen to crop."
+        ),
+        epilog=(
+            "Scripted mode (no display required):\n"
+            "  python -m lolcoach.calibrate --corners 1720,880,1920,1080\n\n"
+            "Interactive mode (Windows with a display, Phase 2+):\n"
+            "  python -m lolcoach.calibrate\n"
+            "  (click the minimap's top-left, then bottom-right corner)"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("calibration.json"),
-        help="Output path for the calibration JSON file (default: ./calibration.json)",
+        help=(
+            "Output path for the calibration JSON file "
+            "(default: ./calibration.json). Parent directories are "
+            "created if needed."
+        ),
     )
     parser.add_argument(
-        "--test-clicks",
+        "--corners",
+        "--test-clicks",  # deprecated alias, still accepted
+        dest="corners",
         type=str,
         default=None,
+        metavar="X1,Y1,X2,Y2",
         help=(
-            "Non-interactive mode: comma-separated 'x1,y1,x2,y2' for the "
-            "minimap corners. Used by tests; humans should omit this flag."
+            "Scripted/headless calibration mode: pass the minimap's "
+            "top-left and bottom-right corners as comma-separated "
+            "integers. This is the only supported mode outside Windows "
+            "with a display and is the recommended path for agents and "
+            "CI. --test-clicks is kept as an alias for backward "
+            "compatibility. Example: --corners 1720,880,1920,1080"
         ),
     )
     return parser
 
 
-def _parse_test_clicks(raw: str) -> tuple[tuple[int, int], tuple[int, int]] | None:
+def _parse_corners(raw: str) -> tuple[tuple[int, int], tuple[int, int]] | None:
     parts = raw.split(",")
     if len(parts) != 4:
         return None
@@ -90,7 +113,8 @@ def _run_interactive() -> ROI | None:  # pragma: no cover - hardware-dependent
     """
     raise NotImplementedError(
         "Interactive calibration lands with the real dxcam integration — "
-        "pass --test-clicks for now, or run on a Windows machine with dxcam."
+        "pass --corners x1,y1,x2,y2 for scripted mode, or run on a "
+        "Windows machine with dxcam."
     )
 
 
@@ -99,11 +123,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
-    if args.test_clicks is not None:
-        parsed = _parse_test_clicks(args.test_clicks)
+    if args.corners is not None:
+        parsed = _parse_corners(args.corners)
         if parsed is None:
             print(
-                "--test-clicks requires exactly 4 comma-separated integers: "
+                "--corners requires exactly 4 comma-separated integers: "
                 "x1,y1,x2,y2",
                 file=sys.stderr,
             )
@@ -118,7 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     # test runners and CI don't crash trying to pop a window.
     print(
         "Interactive calibration is Windows-only for now. "
-        "Pass --test-clicks x1,y1,x2,y2 for scripted calibration, or run this "
+        "Pass --corners x1,y1,x2,y2 for scripted calibration, or run this "
         "command on a Windows machine with dxcam installed.",
         file=sys.stderr,
     )

@@ -12,8 +12,8 @@ Scenarios mapped from the implementation plan's Unit 2 test list:
 6. Edge: ``validate_roi_against_screen`` rejects out-of-bounds ROIs.
 7. Error: first None frame raises :class:`CaptureError`.
 8. Error: 10 consecutive None frames raise :class:`CaptureExhausted`.
-9. Integration: the calibrate subcommand ``--test-clicks`` flow writes a
-   valid calibration.json.
+9. Integration: the calibrate subcommand ``--corners`` flow writes a
+   valid calibration.json (and the ``--test-clicks`` alias still works).
 
 dxcam is Windows-only. These tests mock the camera object so they run on
 any platform.
@@ -236,7 +236,7 @@ def test_grab_minimap_without_camera_raises_runtime_error() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Calibration subcommand: non-interactive --test-clicks flow
+# Calibration subcommand: non-interactive --corners flow
 # ---------------------------------------------------------------------------
 def test_calibrate_compute_roi_handles_ordered_corners() -> None:
     from lolcoach.calibrate import compute_roi
@@ -265,13 +265,13 @@ def test_calibrate_save_calibration_roundtrip(tmp_path: Path) -> None:
     assert load_calibration(path) == roi
 
 
-def test_calibrate_main_with_test_clicks_writes_expected_file(
+def test_calibrate_main_with_corners_writes_expected_file(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from lolcoach.calibrate import main
 
     output = tmp_path / "calibration.json"
-    exit_code = main(["--output", str(output), "--test-clicks", "100,200,300,400"])
+    exit_code = main(["--output", str(output), "--corners", "100,200,300,400"])
 
     assert exit_code == 0
     assert output.exists()
@@ -279,13 +279,45 @@ def test_calibrate_main_with_test_clicks_writes_expected_file(
     assert loaded == {"x": 100, "y": 200, "w": 200, "h": 200}
 
 
-def test_calibrate_main_with_bad_test_clicks_returns_error(
+def test_calibrate_main_test_clicks_alias_still_works(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Backward-compat: --test-clicks is kept as an alias for --corners."""
+    from lolcoach.calibrate import main
+
+    output = tmp_path / "calibration.json"
+    exit_code = main(
+        ["--output", str(output), "--test-clicks", "100,200,300,400"]
+    )
+
+    assert exit_code == 0
+    assert output.exists()
+    loaded = json.loads(output.read_text())
+    assert loaded == {"x": 100, "y": 200, "w": 200, "h": 200}
+
+
+def test_calibrate_main_with_bad_corners_returns_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     from lolcoach.calibrate import main
 
     output = tmp_path / "calibration.json"
-    exit_code = main(["--output", str(output), "--test-clicks", "100,200"])  # only 2 coords
+    exit_code = main(["--output", str(output), "--corners", "100,200"])  # only 2 coords
+
+    assert exit_code == 2
+    assert not output.exists()
+    captured = capsys.readouterr()
+    assert "--corners" in captured.err
+
+
+def test_calibrate_main_with_non_integer_corners_returns_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """F13 bonus: exercise the _parse_corners ValueError branch."""
+    from lolcoach.calibrate import main
+
+    output = tmp_path / "calibration.json"
+    exit_code = main(["--output", str(output), "--corners", "a,b,c,d"])
 
     assert exit_code == 2
     assert not output.exists()
@@ -297,7 +329,7 @@ def test_calibrate_main_interactive_without_display_returns_error(
     from lolcoach.calibrate import main
 
     output = tmp_path / "calibration.json"
-    # Without --test-clicks we fall into the interactive path which is
+    # Without --corners we fall into the interactive path which is
     # Windows-only in practice; on the test runner it should refuse cleanly.
     exit_code = main(["--output", str(output)])
     assert exit_code != 0
