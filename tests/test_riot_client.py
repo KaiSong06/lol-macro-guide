@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import json
+import threading
 import time
 from pathlib import Path
 
@@ -394,6 +395,120 @@ def test_stop_is_idempotent() -> None:
     client = _make_client()
     client.stop()  # never started
     client.stop()  # calling again is a no-op
+
+
+# ---------------------------------------------------------------------------
+# F6 + F7 regression tests: FSM locking + stop() race discipline
+# ---------------------------------------------------------------------------
+def test_stop_preserves_thread_reference_when_join_times_out() -> None:
+    """If the polling thread is stuck in an in-flight HTTP call and join
+    times out, :attr:`_thread` must remain set so a subsequent :meth:`start`
+    refuses to spawn a second thread that would race the orphan.
+    """
+
+    class _StuckThread:
+        def __init__(self) -> None:
+            self.daemon = True
+            self.name = "stuck-mock"
+            self._started = False
+
+        def start(self) -> None:
+            self._started = True
+
+        def join(self, timeout: float | None = None) -> None:
+            pass  # never exits
+
+        def is_alive(self) -> bool:
+            return True
+
+    client = _make_client()
+    stuck = _StuckThread()
+    client._thread = stuck  # type: ignore[assignment]
+
+    client.stop(timeout=0.01)
+
+    assert client._thread is stuck, (
+        "stop() must not clear the thread reference when join timed out"
+    )
+
+
+def test_start_refuses_to_spawn_second_thread_when_orphan_is_alive() -> None:
+    """After a stop() that timed out, start() must not spawn a second
+    polling thread on top of the orphan.
+    """
+
+    class _StuckThread:
+        def __init__(self) -> None:
+            self.daemon = True
+            self.name = "stuck-mock"
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float | None = None) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return True
+
+    client = _make_client()
+    orphan = _StuckThread()
+    client._thread = orphan  # type: ignore[assignment]
+
+    client.start()  # must be a no-op
+
+    assert client._thread is orphan, (
+        "start() must refuse to replace a still-alive thread"
+    )
+
+
+def test_concurrent_poll_once_serializes_via_lock() -> None:
+    """Two threads calling ``poll_once()`` simultaneously must not
+    double-transition the FSM through IDLE → STARTING. The poll lock
+    serializes the read-and-transition sequence so only one full cycle
+    runs at a time.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data = _load_fixture("allgamedata_ingame.json")
+
+    # Use a thread-safe Mocker around a shared adapter. requests_mock
+    # patches the Session's adapter under a lock so registered URLs are
+    # safe to query concurrently from worker threads.
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+
+        barrier = threading.Barrier(4)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait(timeout=5.0)
+                client.poll_once()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5.0)
+
+    assert errors == [], f"worker threads raised: {errors}"
+    assert client.state == LifecycleState.ACTIVE
+
+    # Exactly one IDLE → STARTING transition should have occurred; the
+    # first poll drove the FSM to ACTIVE and subsequent polls took the
+    # already-active branch. Without the poll lock, each worker would
+    # independently have seen IDLE and fired its own transition.
+    idle_to_starting = [
+        (f, t)
+        for (f, t, _) in spy.state_changes
+        if f == LifecycleState.IDLE and t == LifecycleState.STARTING
+    ]
+    assert len(idle_to_starting) == 1, (
+        f"expected exactly 1 IDLE→STARTING, got {len(idle_to_starting)}"
+    )
 
 
 # ---------------------------------------------------------------------------

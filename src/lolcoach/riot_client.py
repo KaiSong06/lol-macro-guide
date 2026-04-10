@@ -153,6 +153,13 @@ class RiotClient:
         self._last_game_time: float | None = None
         self._no_response_since: float | None = None
 
+        # Serializes entire poll cycles so concurrent poll_once() calls
+        # (tests or a rogue thread) cannot double-transition the FSM. The
+        # _state_lock stays a short lock for external reads via the
+        # ``state`` property; this one covers the full read-and-decide
+        # block inside a single poll.
+        self._poll_lock = threading.Lock()
+
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._poll_interval_s = config.poll_interval_ms / 1000.0
@@ -170,7 +177,13 @@ class RiotClient:
             return self._state
 
     def start(self) -> None:
-        """Spawn the polling thread. Idempotent."""
+        """Spawn the polling thread. Idempotent.
+
+        If an earlier thread is still alive (e.g., a previous :meth:`stop`
+        timed out waiting for an in-flight HTTP call to finish), this is
+        a no-op — spawning a second thread would race the orphan for the
+        state lock and double-transition the FSM.
+        """
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop_event.clear()
@@ -179,16 +192,46 @@ class RiotClient:
         )
         self._thread.start()
 
-    def stop(self, timeout: float = 5.0) -> None:
-        """Signal the polling thread to stop and join it. Idempotent."""
+    def stop(self, timeout: float = REQUEST_TIMEOUT_S + 2.0) -> None:
+        """Signal the polling thread to stop and join it.
+
+        The default timeout is ``REQUEST_TIMEOUT_S + 2.0`` so a poll that's
+        mid-HTTP-call has enough slack to finish and the subsequent
+        ``stop_event.wait()`` can exit the loop cleanly. A bare
+        ``timeout=REQUEST_TIMEOUT_S`` would race the HTTP call and leave
+        an orphan thread alive after this returns.
+
+        If the thread is still alive after the join, :attr:`_thread` is
+        **not** cleared — a subsequent :meth:`start` will refuse to spawn
+        a second thread rather than race the orphan.
+        """
         self._stop_event.set()
         thread = self._thread
-        if thread is not None and thread.is_alive():
+        if thread is None:
+            return
+        if thread.is_alive():
             thread.join(timeout=timeout)
+        if thread.is_alive():
+            logger.warning(
+                "riot poll thread did not exit within %.1fs; leaving reference "
+                "in place (start() will refuse until it exits)",
+                timeout,
+            )
+            return
         self._thread = None
 
     def poll_once(self) -> None:
-        """Execute one poll cycle. Exposed for test control."""
+        """Execute one poll cycle. Exposed for test control.
+
+        Serialized by ``_poll_lock`` so concurrent calls (tests + real
+        thread, or two tests in parallel) cannot race the FSM through a
+        double transition.
+        """
+        with self._poll_lock:
+            self._poll_once_locked()
+
+    def _poll_once_locked(self) -> None:
+        """Body of :meth:`poll_once`, assumed to run under ``_poll_lock``."""
         try:
             resp = self._session.get(
                 self._url, timeout=REQUEST_TIMEOUT_S, verify=False
@@ -232,8 +275,8 @@ class RiotClient:
         while not self._stop_event.is_set():
             try:
                 self.poll_once()
-            except Exception as exc:
-                logger.exception("unexpected error in riot poll loop: %s", exc)
+            except Exception:
+                logger.exception("unexpected error in riot poll loop")
             self._stop_event.wait(self._poll_interval_s)
 
     def _transition(self, new_state: LifecycleState, reason: str) -> None:
