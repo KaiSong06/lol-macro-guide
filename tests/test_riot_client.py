@@ -549,3 +549,48 @@ def test_is_jungle_role_false_for_top_lane() -> None:
 
 def test_is_jungle_role_handles_missing_fields() -> None:
     assert _is_jungle_role({}) is False
+
+
+# ---------------------------------------------------------------------------
+# F4 regression: verify=False must be scoped to loopback only
+# ---------------------------------------------------------------------------
+def test_riot_client_accepts_127_0_0_1_base_url() -> None:
+    config = RiotApiConfig(base_url="https://127.0.0.1:2999")
+    client = RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+    assert client.state == LifecycleState.IDLE
+
+
+def test_riot_client_accepts_localhost_base_url() -> None:
+    config = RiotApiConfig(base_url="https://localhost:2999")
+    client = RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+    assert client.state == LifecycleState.IDLE
+
+
+def test_riot_client_accepts_ipv6_loopback_base_url() -> None:
+    config = RiotApiConfig(base_url="https://[::1]:2999")
+    client = RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+    assert client.state == LifecycleState.IDLE
+
+
+def test_riot_client_rejects_non_loopback_hostname() -> None:
+    """If a misconfigured or tampered config.yaml points base_url at a
+    non-loopback host, the client must refuse to construct. Otherwise
+    verify=False silently accepts any cert for that host and the coach
+    becomes an MITM-able screen-capture exfil vector.
+    """
+    config = RiotApiConfig(base_url="https://evil.example.com:2999")
+    with pytest.raises(ValueError, match="loopback"):
+        RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+
+
+def test_riot_client_rejects_public_ip_address() -> None:
+    config = RiotApiConfig(base_url="https://203.0.113.1:2999")
+    with pytest.raises(ValueError, match="loopback"):
+        RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+
+
+def test_riot_client_rejects_missing_host() -> None:
+    """A base_url with no hostname at all is a config error."""
+    config = RiotApiConfig(base_url="not-a-url")
+    with pytest.raises(ValueError, match="base_url"):
+        RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())

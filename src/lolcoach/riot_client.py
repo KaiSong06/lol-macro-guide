@@ -27,6 +27,7 @@ otherwise every poll would log a noisy warning.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import threading
 import time
@@ -34,6 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import urllib3
@@ -127,6 +129,42 @@ def _extract_role(player: dict[str, Any]) -> str:
     return pos or "UNKNOWN"
 
 
+def _assert_loopback_base_url(base_url: str) -> None:
+    """Reject any ``base_url`` whose host is not a loopback address.
+
+    The client ships with ``verify=False`` because the Live Client Data API
+    runs on a self-signed localhost certificate. That bypass is only safe
+    when the target is the loopback interface — an attacker who can tamper
+    with ``config.yaml`` could otherwise point ``base_url`` at a remote
+    host and silently exfiltrate summoner names over an unverified TLS
+    connection. This check enforces the loopback invariant at construction
+    time so the failure mode is impossible, not merely discouraged.
+    """
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError(
+            f"RiotClient base_url must have a hostname; got {base_url!r}"
+        )
+    # Accept the literal ``localhost`` alias even though it resolves at
+    # runtime — DNS resolution against /etc/hosts's localhost entry is
+    # effectively loopback for any sane system.
+    if host.lower() == "localhost":
+        return
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError(
+            f"RiotClient base_url host must be an IP address or 'localhost' "
+            f"(got {host!r}); verify=False TLS bypass is scoped to loopback only"
+        ) from exc
+    if not ip.is_loopback:
+        raise ValueError(
+            f"RiotClient base_url must be a loopback address "
+            f"(got {host!r}); verify=False TLS bypass is scoped to loopback only"
+        )
+
+
 # ---------------------------------------------------------------------------
 # RiotClient
 # ---------------------------------------------------------------------------
@@ -143,6 +181,7 @@ class RiotClient:
         callbacks: Callbacks,
         session: requests.Session | None = None,
     ) -> None:
+        _assert_loopback_base_url(config.base_url)
         self._config = config
         self._callbacks = callbacks
         self._session = session or requests.Session()
