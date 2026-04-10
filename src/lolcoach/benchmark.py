@@ -186,24 +186,85 @@ def run_benchmark(
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m lolcoach.benchmark",
-        description="Benchmark vision LLM latency for lolcoach.",
+        description=(
+            "Benchmark vision LLM latency for lolcoach. Sends N sequential "
+            "POSTs to Ollama's /api/chat with the same image + prompt, "
+            "measures per-call wall-clock latency, and reports "
+            "count/min/max/mean/p50/p95 plus distinct counters for "
+            "timeouts, connection errors, and HTTP errors."
+        ),
+        epilog=(
+            "Example:\n"
+            "  python -m lolcoach.benchmark \\\n"
+            "    --fixture tests/fixtures/minimap_sample.png \\\n"
+            "    --model gemma3:4b --n 20\n\n"
+            "Apply the Week 1 decision tree to the result:\n"
+            "  <=5s  -> keep current model\n"
+            "  5-8s  -> acceptable, continue\n"
+            "  8-12s -> try smaller model or reduce capture cadence\n"
+            "  >12s  -> drop to text-only coaching"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--fixture", type=Path, required=True)
-    parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
-    parser.add_argument("--n", type=int, default=DEFAULT_N)
-    parser.add_argument("--prompt", type=str, default=DEFAULT_PROMPT)
-    parser.add_argument("--ollama-url", type=str, default=DEFAULT_OLLAMA_URL)
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        required=True,
+        help="Path to the minimap image file to benchmark against (PNG, JPG).",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL,
+        help=f"Ollama vision model tag (default: {DEFAULT_MODEL}).",
+    )
+    parser.add_argument(
+        "--n",
+        type=int,
+        default=DEFAULT_N,
+        help=(
+            f"Number of sequential calls to the Ollama endpoint "
+            f"(default: {DEFAULT_N}). Must be >= 1."
+        ),
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=DEFAULT_PROMPT,
+        help=(
+            "Prompt text sent alongside the image. Default is a short "
+            "minimap-description instruction suitable for the vision "
+            "models in the candidate list."
+        ),
+    )
+    parser.add_argument(
+        "--ollama-url",
+        type=str,
+        default=DEFAULT_OLLAMA_URL,
+        help=(
+            f"Full URL of the Ollama chat endpoint "
+            f"(default: {DEFAULT_OLLAMA_URL})."
+        ),
+    )
     parser.add_argument(
         "--log-dir",
         type=Path,
         default=Path("./logs"),
-        help="Directory for the JSONL benchmark report",
+        help=(
+            "Directory for the JSONL benchmark report "
+            "(default: ./logs). Created on demand. The run produces one "
+            "file named benchmark-{iso8601}.jsonl."
+        ),
     )
     parser.add_argument(
         "--timeout-s",
         type=float,
         default=DEFAULT_TIMEOUT_S,
-        help="Per-call timeout in seconds",
+        help=(
+            f"Per-call timeout in seconds (default: {DEFAULT_TIMEOUT_S}). "
+            "Requests exceeding this time count as timeout_count and are "
+            "excluded from latency stats."
+        ),
     )
     return parser
 
