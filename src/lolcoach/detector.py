@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -59,10 +59,34 @@ class ChampionDetection:
 
 @dataclass(frozen=True)
 class DetectionResult:
-    """The set of detections for one frame plus the wall-clock timestamp."""
+    """The set of detections for one frame plus the wall-clock timestamp.
+
+    The ``last_seen_champions`` field carries the frozenset of names
+    detected on *this frame*. The DecisionFilter grounding check (Unit 8)
+    reads it from the result instead of the detector instance so the
+    grounding decision is always pinned to the frame the LLM was shown,
+    eliminating the cross-thread stale-read path where the capture thread
+    could advance the detector's state during an in-flight Ollama call.
+
+    If not explicitly provided, ``last_seen_champions`` is auto-derived
+    from the ``champions`` tuple in ``__post_init__``. This keeps tests
+    that construct DetectionResult directly simple while still letting
+    ``Detector.detect()`` populate it explicitly at the real call site.
+    """
 
     champions: tuple[ChampionDetection, ...]
     detected_at: float
+    last_seen_champions: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        # Auto-derive from champions when not explicitly provided. Use the
+        # frozen-dataclass escape hatch to set the field.
+        if not self.last_seen_champions and self.champions:
+            object.__setattr__(
+                self,
+                "last_seen_champions",
+                frozenset(c.name for c in self.champions),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +124,6 @@ class Detector:
         self._confidence_threshold = confidence_threshold
         self._nms_iou_threshold = nms_iou_threshold
         self._templates: dict[str, np.ndarray] = {}
-        self._last_seen_champions: frozenset[str] = frozenset()
         self._load_templates(Path(template_dir))
 
     # ------------------------------------------------------------------
@@ -110,14 +133,6 @@ class Detector:
     def known_champions(self) -> frozenset[str]:
         """Names of all templates successfully loaded at construction."""
         return frozenset(self._templates)
-
-    @property
-    def last_seen_champions(self) -> frozenset[str]:
-        """Names of champions detected on the most recent frame.
-
-        Used by the DecisionFilter grounding check in Unit 8.
-        """
-        return self._last_seen_champions
 
     def detect(
         self,
@@ -169,10 +184,10 @@ class Detector:
                     )
                 )
 
-        self._last_seen_champions = frozenset(d.name for d in detections)
         return DetectionResult(
             champions=tuple(detections),
             detected_at=time.time(),
+            last_seen_champions=frozenset(d.name for d in detections),
         )
 
     # ------------------------------------------------------------------

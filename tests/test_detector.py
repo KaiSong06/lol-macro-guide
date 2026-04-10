@@ -82,16 +82,36 @@ def test_detect_single_enemy_returns_one_detection_with_correct_position() -> No
     assert result.detected_at > 0
 
 
-def test_detect_populates_last_seen_champions() -> None:
+def test_detect_populates_last_seen_champions_on_result() -> None:
+    """The grounding set is on the DetectionResult itself, not the Detector
+    instance. This pins each grounding decision to the frame the LLM was
+    shown and removes the cross-thread stale-read path (F8 from /ce:review).
+    """
     detector = Detector(FIXTURE_TEMPLATE_DIR)
 
     frame = np.full((512, 512, 3), 50, dtype=np.uint8)
     _embed(frame, _load_template("LeeSin"), top_left=(100, 100))
     _embed(frame, _load_template("Jinx"), top_left=(300, 300))
 
-    detector.detect(frame, ally_names=["Jinx"], enemy_names=["LeeSin"])
+    result = detector.detect(frame, ally_names=["Jinx"], enemy_names=["LeeSin"])
 
-    assert detector.last_seen_champions == {"LeeSin", "Jinx"}
+    assert result.last_seen_champions == frozenset({"LeeSin", "Jinx"})
+    # The Detector instance should not retain any mutable last-seen state.
+    assert not hasattr(detector, "_last_seen_champions")
+    assert not hasattr(detector, "last_seen_champions")
+
+
+def test_detect_empty_result_has_empty_last_seen() -> None:
+    """A frame with no detections still carries a last_seen_champions field
+    so downstream consumers can rely on the field existing unconditionally.
+    """
+    detector = Detector(FIXTURE_TEMPLATE_DIR, confidence_threshold=0.999)
+    frame = np.full((512, 512, 3), 127, dtype=np.uint8)
+
+    result = detector.detect(frame, ally_names=[], enemy_names=["LeeSin"])
+
+    assert result.champions == ()
+    assert result.last_seen_champions == frozenset()
 
 
 # ---------------------------------------------------------------------------
