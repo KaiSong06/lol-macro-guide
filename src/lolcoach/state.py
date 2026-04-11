@@ -50,6 +50,17 @@ class GameState:
 
     game_time_seconds: float = 0.0
     active_summoner_name: str | None = None
+    #: The active player's champion name (e.g. "Hecarim"). Sourced from
+    #: ``allPlayers[i].championName`` for the entry whose summonerName
+    #: matches the active player. ``None`` until the first Riot poll
+    #: identifies the active player; the prompt builder uses this to
+    #: tell the LLM "you are coaching a Hecarim jungler".
+    active_player_champion: str | None = None
+    #: The active player's current gold (integer-truncated). Sourced from
+    #: ``activePlayer.currentGold``. ``None`` if the field is missing or
+    #: non-numeric — the prompt builder treats ``None`` as "unknown" and
+    #: omits the gold line rather than telling the LLM the player is broke.
+    active_player_gold: int | None = None
     ally_champions: frozenset[str] = frozenset()
     enemy_champions: frozenset[str] = frozenset()
     all_champions: frozenset[str] = frozenset()
@@ -72,6 +83,8 @@ class StateManager:
         self._lock = threading.RLock()
         self._game_time_seconds: float = 0.0
         self._active_summoner_name: str | None = None
+        self._active_player_champion: str | None = None
+        self._active_player_gold: int | None = None
         self._ally_champions: set[str] = set()
         self._enemy_champions: set[str] = set()
         self._enemy_jungler_champion_name: str | None = None
@@ -105,12 +118,30 @@ class StateManager:
             active = data.get("activePlayer") or {}
             self._active_summoner_name = active.get("summonerName")
 
+            # Coerce currentGold to int defensively. Real Riot payloads return
+            # a float (e.g. 3200.456), but older clients sometimes omit the
+            # field entirely and external data is external data, so a missing
+            # or unparseable value collapses to None rather than 0 — the
+            # prompt builder treats None as "unknown" and omits the line.
+            gold_raw = active.get("currentGold")
+            if gold_raw is None:
+                self._active_player_gold = None
+            else:
+                try:
+                    self._active_player_gold = int(gold_raw)
+                except (TypeError, ValueError):
+                    self._active_player_gold = None
+
             all_players = data.get("allPlayers") or []
             active_player_entry = None
             for p in all_players:
                 if p.get("summonerName") == self._active_summoner_name:
                     active_player_entry = p
                     break
+
+            self._active_player_champion = (
+                (active_player_entry or {}).get("championName")
+            )
 
             active_team = (active_player_entry or {}).get("team")
             ally: set[str] = set()
@@ -190,6 +221,8 @@ class StateManager:
         with self._lock:
             self._game_time_seconds = 0.0
             self._active_summoner_name = None
+            self._active_player_champion = None
+            self._active_player_gold = None
             self._ally_champions = set()
             self._enemy_champions = set()
             self._enemy_jungler_champion_name = None
@@ -218,6 +251,8 @@ class StateManager:
             return GameState(
                 game_time_seconds=self._game_time_seconds,
                 active_summoner_name=self._active_summoner_name,
+                active_player_champion=self._active_player_champion,
+                active_player_gold=self._active_player_gold,
                 ally_champions=frozenset(self._ally_champions),
                 enemy_champions=frozenset(self._enemy_champions),
                 all_champions=frozenset(

@@ -46,6 +46,8 @@ def test_fresh_state_manager_has_cold_start_defaults() -> None:
 
     assert isinstance(snap, GameState)
     assert snap.game_time_seconds == 0.0
+    assert snap.active_player_champion is None
+    assert snap.active_player_gold is None
     assert snap.enemy_jungler_last_seen is None
     assert snap.enemy_jungler_predicted_quadrant is None
     assert snap.all_champions == frozenset()
@@ -60,6 +62,8 @@ def test_update_from_riot_populates_fields() -> None:
     snap = sm.snapshot()
     assert snap.game_time_seconds == 742.5
     assert snap.active_summoner_name == "ActivePlayer#NA1"
+    assert snap.active_player_champion == "Hecarim"
+    assert snap.active_player_gold == 3200
     assert "Hecarim" in snap.ally_champions
     assert "Jinx" in snap.ally_champions
     assert "LeeSin" in snap.enemy_champions
@@ -68,6 +72,36 @@ def test_update_from_riot_populates_fields() -> None:
         {"Hecarim", "Jinx", "Ahri", "LeeSin", "Ekko"}
     )
     assert snap.enemy_jungler_champion_name == "LeeSin"
+
+
+def test_update_from_riot_missing_currentgold_keeps_field_none() -> None:
+    """Older Live Client Data API versions sometimes omit ``currentGold`` from
+    the ``activePlayer`` block. The state manager treats it as a soft field and
+    leaves it as ``None`` rather than crashing or defaulting to zero (which
+    would mislead the prompt builder into telling the LLM the player is broke).
+    """
+    sm = StateManager()
+    data = _load_fixture("allgamedata_ingame.json")
+    del data["activePlayer"]["currentGold"]
+    sm.update_from_riot(data)
+
+    snap = sm.snapshot()
+    assert snap.active_player_gold is None
+    # Champion is still present — only currentGold was stripped.
+    assert snap.active_player_champion == "Hecarim"
+
+
+def test_update_from_riot_non_numeric_currentgold_keeps_field_none() -> None:
+    """If Riot returns a non-numeric currentGold (string, null, dict — should
+    never happen, but external data is external data), the state manager
+    coerces gracefully to None rather than raising.
+    """
+    sm = StateManager()
+    data = _load_fixture("allgamedata_ingame.json")
+    data["activePlayer"]["currentGold"] = "not-a-number"
+    sm.update_from_riot(data)
+
+    assert sm.snapshot().active_player_gold is None
 
 
 def test_update_from_detector_sets_enemy_jungler_last_seen() -> None:
@@ -188,6 +222,8 @@ def test_reset_clears_everything() -> None:
 
     snap = sm.snapshot()
     assert snap.game_time_seconds == 0.0
+    assert snap.active_player_champion is None
+    assert snap.active_player_gold is None
     assert snap.all_champions == frozenset()
     assert snap.ally_champions == frozenset()
     assert snap.enemy_champions == frozenset()
