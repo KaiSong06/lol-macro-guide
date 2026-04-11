@@ -20,6 +20,8 @@ wrong tradeoff for a prompt that will be tuned against benchmark data.
 
 from __future__ import annotations
 
+from typing import Any
+
 from lolcoach.detector import ChampionDetection, DetectionResult
 from lolcoach.prompts import (
     ALLOWED_CATEGORIES,
@@ -290,19 +292,118 @@ def test_build_user_prompt_cold_start_omits_currently_visible_when_no_detections
     assert "Currently visible on minimap:" not in prompt
 
 
-def test_build_user_prompt_cold_start_omits_objectives_when_no_events() -> None:
+def test_build_user_prompt_cold_start_objectives_line_shows_none_explicitly() -> None:
+    """Empty riot_events is information ('no objectives taken yet'), not
+    missing data — production unconditionally appends 'Recent objectives: none'
+    so the LLM has a positive signal rather than wondering whether the
+    field was omitted. Pin the contract: the line MUST appear and the
+    value MUST be 'none' (case-insensitive).
+    """
     state = _make_cold_start_state()  # riot_events is empty
     prompt = build_user_prompt(state, _empty_detections())
 
-    # Empty riot_events → no objective callout. Show "Recent objectives: none"
-    # OR omit the line — both are honest. We choose "none" for symmetry with
-    # the kill feed (both are event-stream summaries).
-    if "Recent objectives:" in prompt:
-        objectives_line = next(
-            line for line in prompt.splitlines()
-            if line.startswith("Recent objectives:")
+    assert "Recent objectives:" in prompt, (
+        "production unconditionally emits the line; tightening the test "
+        "from a vacuous conditional to a hard assertion (review finding 8)"
+    )
+    objectives_line = next(
+        line for line in prompt.splitlines()
+        if line.startswith("Recent objectives:")
+    )
+    assert "none" in objectives_line.lower()
+
+
+def test_build_user_prompt_with_last_seen_but_no_predicted_quadrant() -> None:
+    """The ``if predicted_quadrant:`` false branch in build_user_prompt's
+    inlined enemy-jungler section is hit only when last_seen is set but
+    enemy_jungler_predicted_quadrant is None. The full-state and cold-start
+    fixtures don't cover this combination — tests/test_prompts.py partial
+    branch coverage was the missing case (review finding 14).
+    """
+    state = GameState(
+        game_time_seconds=600.0,
+        active_summoner_name="ActivePlayer#NA1",
+        active_player_champion="Hecarim",
+        enemy_jungler_champion_name="LeeSin",
+        enemy_jungler_last_seen=("bot_jungle", 540.0),
+        enemy_jungler_predicted_quadrant=None,  # the missing case
+    )
+
+    prompt = build_user_prompt(state, _empty_detections())
+
+    # The line is present (last_seen is not None).
+    enemy_line = next(
+        line for line in prompt.splitlines()
+        if line.startswith("Enemy jungler:")
+    )
+    # The "predicted in" suffix is omitted.
+    assert "predicted in" not in enemy_line
+    assert "last seen in bot_jungle" in enemy_line
+
+
+def test_build_user_prompt_objectives_line_capped_at_recency_limit() -> None:
+    """state.riot_events is unbounded (Riot returns the full cumulative
+    event history every poll), so the rendered objectives line could grow
+    linearly with game length and inflate prompt token count on every
+    500ms call. Verify the trim caps the rendered count regardless of
+    how many objective events accumulate (review finding 12).
+    """
+    # Construct a synthetic event stream with 30 dragon kills — well
+    # above the cap. Mixed with non-objective events that should be
+    # filtered out before the cap is applied.
+    riot_events: list[dict[str, Any]] = []
+    for i in range(30):
+        riot_events.append(
+            {
+                "EventID": i * 2,
+                "EventName": "DragonKill",
+                "EventTime": float(60 + i * 30),
+                "DragonType": "Infernal",
+            }
         )
-        assert "none" in objectives_line.lower()
+        riot_events.append(
+            {
+                "EventID": i * 2 + 1,
+                "EventName": "MinionsSpawning",  # filtered out
+                "EventTime": float(60 + i * 30 + 5),
+            }
+        )
+
+    state = GameState(
+        game_time_seconds=2000.0,
+        active_summoner_name="P",
+        active_player_champion="Hecarim",
+        riot_events=tuple(riot_events),
+    )
+
+    prompt = build_user_prompt(state, _empty_detections())
+    objectives_line = next(
+        line for line in prompt.splitlines()
+        if line.startswith("Recent objectives:")
+    )
+    rendered_count = objectives_line.count("DragonKill")
+    # The cap should keep rendered count bounded — definitely fewer than
+    # the 30 events we pushed in. We don't pin the exact number to keep
+    # the test resilient to a future cap tweak.
+    assert rendered_count > 0, "objectives line should still render some events"
+    assert rendered_count <= 12, (
+        f"objectives line is supposed to be capped to a recency window, "
+        f"but rendered {rendered_count} of 30 events — the trim is missing "
+        f"or the limit is too generous"
+    )
+
+    # Additionally verify recency: the rendered line should contain the
+    # LATEST event timestamp, not the earliest one.
+    latest_event_time = max(
+        float(ev["EventTime"]) for ev in riot_events
+        if ev["EventName"] == "DragonKill"
+    )
+    minutes, secs = divmod(int(latest_event_time), 60)
+    latest_timestamp = f"{minutes}:{secs:02d}"
+    assert latest_timestamp in objectives_line, (
+        f"objectives line must include the most-recent event "
+        f"({latest_timestamp}); got: {objectives_line}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -70,6 +70,17 @@ _OBJECTIVE_EVENT_NAMES: frozenset[str] = frozenset(
     }
 )
 
+#: Cap on how many recent objective events the user prompt renders.
+#: ``state.riot_events`` is unbounded — Riot's Live Client Data API returns
+#: the full cumulative event history on every poll, so a 60-minute game can
+#: easily produce 30+ matching events. Without a cap, the rendered objectives
+#: line grows linearly with game length and inflates the LLM prompt token
+#: count on every 500 ms call, eating into the 5-8 s latency budget that
+#: scales with context size. The cap is intentionally on the OUTPUT side
+#: (not on ``state.riot_events`` itself) so the rest of the codebase keeps
+#: the full event history available for any future consumer that needs it.
+_OBJECTIVES_PROMPT_LIMIT = 8
+
 
 # ---------------------------------------------------------------------------
 # System prompt — static template
@@ -157,24 +168,27 @@ def build_user_prompt(state: GameState, detections: DetectionResult) -> str:
 
     # Enemy jungler — COLD-START RULE: omit entirely if last_seen is None.
     if state.enemy_jungler_last_seen is not None:
-        lines.append(
-            _format_enemy_jungler_line(
-                champion_name=state.enemy_jungler_champion_name,
-                last_seen=state.enemy_jungler_last_seen,
-                predicted_quadrant=state.enemy_jungler_predicted_quadrant,
-                game_time_seconds=state.game_time_seconds,
-            )
+        quadrant, ts = state.enemy_jungler_last_seen
+        age = max(0.0, state.game_time_seconds - ts)
+        name = state.enemy_jungler_champion_name or "enemy jungler"
+        jungler_line = (
+            f"Enemy jungler: {name}, last seen in {quadrant} ~{int(age)}s ago"
         )
+        if state.enemy_jungler_predicted_quadrant:
+            jungler_line += (
+                f", predicted in {state.enemy_jungler_predicted_quadrant}"
+            )
+        lines.append(jungler_line)
 
     # Recent kills — always present (event-stream summary).
     lines.append(f"Recent kills: {_format_kill_feed(state.kill_feed)}")
 
     # Currently visible from the latest detector frame — omit if no hits.
     if detections.champions:
-        lines.append(
-            "Currently visible on minimap: "
-            + _format_visible_champions(detections)
+        visible = ", ".join(
+            f"{c.name} ({c.quadrant})" for c in detections.champions
         )
+        lines.append(f"Currently visible on minimap: {visible}")
 
     lines.append("=== END GAME STATE ===")
     lines.append("")
@@ -204,8 +218,12 @@ def _format_objectives(riot_events: tuple[dict[str, Any], ...]) -> str:
     """Filter ``riot_events`` for objective-relevant entries and join them.
 
     Only events whose ``EventName`` is in ``_OBJECTIVE_EVENT_NAMES`` are
-    included. Each entry is rendered as ``<EventName> at <MM:SS>``. If
-    nothing matches, returns the literal string ``none``.
+    included. The result is capped at the last
+    :data:`_OBJECTIVES_PROMPT_LIMIT` entries so the rendered prompt stays
+    constant-size regardless of game length. If nothing matches, returns
+    the literal string ``none``.
+
+    Each entry is rendered as ``<EventName> at <MM:SS>``.
     """
     items: list[str] = []
     for event in riot_events:
@@ -216,24 +234,10 @@ def _format_objectives(riot_events: tuple[dict[str, Any], ...]) -> str:
         items.append(f"{name} at {when}")
     if not items:
         return "none"
-    return "; ".join(items)
-
-
-def _format_enemy_jungler_line(
-    champion_name: str | None,
-    last_seen: tuple[str, float],
-    predicted_quadrant: str | None,
-    game_time_seconds: float,
-) -> str:
-    """Render the enemy jungler line. Caller verifies last_seen is not None."""
-    quadrant, ts = last_seen
-    age = max(0.0, game_time_seconds - ts)
-    age_text = f"~{int(age)}s ago"
-    name = champion_name or "enemy jungler"
-    line = f"Enemy jungler: {name}, last seen in {quadrant} {age_text}"
-    if predicted_quadrant:
-        line += f", predicted in {predicted_quadrant}"
-    return line
+    # Keep only the most-recent N entries — the early-game objectives
+    # carry less coaching value than the recent ones, and the cap stops
+    # the prompt from growing linearly with game length.
+    return "; ".join(items[-_OBJECTIVES_PROMPT_LIMIT:])
 
 
 def _format_kill_feed(kill_feed: tuple[dict[str, Any], ...]) -> str:
@@ -250,10 +254,3 @@ def _format_kill_feed(kill_feed: tuple[dict[str, Any], ...]) -> str:
         when = _format_game_time(float(kill.get("EventTime", 0.0)))
         items.append(f"{killer} killed {victim} at {when}")
     return "; ".join(items)
-
-
-def _format_visible_champions(detections: DetectionResult) -> str:
-    """Render detector hits as ``Name (quadrant)`` pairs separated by ``,``."""
-    return ", ".join(
-        f"{c.name} ({c.quadrant})" for c in detections.champions
-    )

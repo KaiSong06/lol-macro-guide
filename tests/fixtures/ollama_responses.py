@@ -109,6 +109,71 @@ CONFIDENCE_NOT_INTEGER = (
     "REASON: Some reason text.\n"
 )
 
+#: CONFIDENCE value at the lower boundary (1). Must parse as a valid
+#: Callout — the schema documents 1-10 inclusive.
+CONFIDENCE_LOWER_BOUND = (
+    "DECISION: Stand back, let the wave push\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: top\n"
+    "CONFIDENCE: 1\n"
+    "REASON: Low certainty about enemy intent.\n"
+)
+
+#: CONFIDENCE value at the upper boundary (10). Must parse as a valid
+#: Callout.
+CONFIDENCE_UPPER_BOUND = (
+    "DECISION: Smite Baron now\n"
+    "CATEGORY: objective_call\n"
+    "TARGET_LANE: global\n"
+    "CONFIDENCE: 10\n"
+    "REASON: Baron is at execute range and enemy team is dead.\n"
+)
+
+#: CONFIDENCE value of zero — below the [1, 10] range. Must reject.
+CONFIDENCE_ZERO = (
+    "DECISION: Path to bot river\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: bot\n"
+    "CONFIDENCE: 0\n"
+    "REASON: Some reason text.\n"
+)
+
+#: Negative CONFIDENCE value. int() parses negative integers cleanly so
+#: the range gate is the only thing that catches this. Must reject.
+CONFIDENCE_NEGATIVE = (
+    "DECISION: Path to bot river\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: bot\n"
+    "CONFIDENCE: -3\n"
+    "REASON: Some reason text.\n"
+)
+
+#: Fractional CONFIDENCE value (8.5). int('8.5') raises ValueError, so the
+#: parser must collapse to None rather than crashing. Real failure mode:
+#: the model writes a decimal number to express partial confidence.
+CONFIDENCE_FRACTIONAL = (
+    "DECISION: Path to bot river\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: bot\n"
+    "CONFIDENCE: 8.5\n"
+    "REASON: Some reason text.\n"
+)
+
+#: Two DECISION lines in the same response. The parser uses
+#: ``re.search`` which returns the FIRST match — pin the contract so a
+#: future "last wins" refactor would break this test rather than
+#: silently change behavior. Real failure mode: a model that
+#: self-corrects mid-stream and emits a second DECISION line below
+#: the first.
+DUPLICATE_DECISION = (
+    "DECISION: Path to bot river\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: bot\n"
+    "CONFIDENCE: 8\n"
+    "REASON: Lee Sin pathing through bot river.\n"
+    "DECISION: Actually wait at top river\n"
+)
+
 #: Empty DECISION line. Even if every other field parses, an empty
 #: decision is unspeakable — TTS would broadcast silence. Reject.
 EMPTY_DECISION = (

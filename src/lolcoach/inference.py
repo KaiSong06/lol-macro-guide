@@ -33,12 +33,14 @@ via stdlib ``logging.Handler``. Until then, the module logs through stdlib
 from __future__ import annotations
 
 import base64
+import ipaddress
 import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -59,6 +61,14 @@ logger = logging.getLogger(__name__)
 #: Confidence range matches the system prompt rule (1-10 inclusive).
 _MIN_CONFIDENCE = 1
 _MAX_CONFIDENCE = 10
+
+#: Floor for the warmup timeout in seconds. The plan documents that
+#: cold-start model loading can take 10-20 s, so warmup uses
+#: ``max(_WARMUP_MIN_TIMEOUT_S, self._timeout_s)`` to give a fresh
+#: Ollama process time to load the model on the first call. Per-frame
+#: ``run()`` still uses the configured ``timeout_ms`` so live coaching
+#: stays tight to the 8 s latency budget.
+_WARMUP_MIN_TIMEOUT_S = 30.0
 
 #: Per-field regex — anchored on the field key with optional horizontal
 #: whitespace only (``[ \t]*`` not ``\s*``, so the engine cannot eat newlines
@@ -175,6 +185,53 @@ def _parse_response(text: str) -> Callout | None:
 
 
 # ---------------------------------------------------------------------------
+# Construction-time validation helpers
+# ---------------------------------------------------------------------------
+def _assert_loopback_ollama_host(ollama_host: str) -> None:
+    """Reject any ``ollama_host`` whose host is not a loopback address.
+
+    The inference engine forwards the full game-state context block plus
+    the base64-encoded minimap PNG to the configured Ollama host on every
+    call. If a user (or an attacker who can tamper with ``config.yaml``)
+    points ``inference.ollama_host`` at a remote URL, every callout would
+    silently exfiltrate summoner names, kill feed entries, and the live
+    minimap screenshot to that remote server. This check enforces the
+    loopback invariant at construction time so the failure mode is
+    impossible, not merely discouraged.
+
+    The same loopback rule lives in :func:`lolcoach.riot_client._assert_loopback_base_url`;
+    the helper is duplicated rather than shared to avoid an import cycle
+    between ``inference`` and ``riot_client`` (both modules are
+    independently consumed by Unit 10's orchestrator).
+    """
+    parsed = urlparse(ollama_host)
+    host = parsed.hostname
+    if not host:
+        raise ValueError(
+            f"InferenceConfig.ollama_host must have a hostname; got {ollama_host!r}"
+        )
+    # Accept the literal ``localhost`` alias even though it resolves at
+    # runtime — DNS resolution against the system's localhost entry is
+    # effectively loopback for any sane system.
+    if host.lower() == "localhost":
+        return
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError(
+            f"InferenceConfig.ollama_host must be an IP address or 'localhost' "
+            f"(got {host!r}); the engine sends prompts and minimap frames to "
+            f"this URL on every call so it must point at the loopback interface"
+        ) from exc
+    if not ip.is_loopback:
+        raise ValueError(
+            f"InferenceConfig.ollama_host must be a loopback address "
+            f"(got {host!r}); the engine sends prompts and minimap frames to "
+            f"this URL on every call so it must point at the loopback interface"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 class InferenceEngine:
@@ -186,11 +243,26 @@ class InferenceEngine:
     """
 
     def __init__(self, config: InferenceConfig) -> None:
+        # Fail-fast at the boundary on misconfiguration. The orchestrator
+        # surfaces the ValueError as a clear startup error rather than
+        # crashing the inference worker thread mid-game.
+        if config.timeout_ms <= 0:
+            raise ValueError(
+                f"InferenceConfig.timeout_ms must be > 0 "
+                f"(got {config.timeout_ms!r}); a non-positive value would "
+                f"make every requests.post raise ValueError mid-game"
+            )
+        _assert_loopback_ollama_host(config.ollama_host)
+
         self._config = config
         self._session = requests.Session()
         self._lock = threading.Lock()
         self._chat_url = f"{config.ollama_host.rstrip('/')}/api/chat"
         self._timeout_s = config.timeout_ms / 1000.0
+        # The warmup ping has its own (looser) timeout because the plan
+        # documents 10-20 s cold-start model loading. Live coaching uses
+        # the configured per-frame timeout to stay under the 8 s budget.
+        self._warmup_timeout_s = max(_WARMUP_MIN_TIMEOUT_S, self._timeout_s)
 
     # ------------------------------------------------------------------
     # Public API
@@ -200,42 +272,58 @@ class InferenceEngine:
 
         Returns ``True`` if Ollama responded with a 200 (the model is
         loaded and serving). Returns ``False`` on any HTTP error,
-        timeout, or connection failure. Called once at coach startup
-        to avoid the 10-20s cold-start latency on the first real callout.
+        timeout, connection failure, or unexpected exception during body
+        construction. Called once at coach startup to avoid the 10-20 s
+        cold-start latency on the first real callout.
+
+        Uses :data:`self._warmup_timeout_s` (a floor of 30 s) instead of
+        the per-frame ``timeout_s`` so a fresh Ollama process has time to
+        load the model on the first call.
 
         The warmup request carries ``keep_alive: -1`` so the model
         stays pinned in VRAM until the process exits.
         """
-        # A 1x1 black image is enough to satisfy the vision input contract.
-        tiny_frame = np.zeros((1, 1, 3), dtype=np.uint8)
-        body = {
-            "model": self._config.model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "warmup",
-                    "images": [_encode_frame(tiny_frame)],
-                }
-            ],
-            "stream": False,
-            "keep_alive": self._config.keep_alive,
-        }
         try:
+            # A 1x1 black image is enough to satisfy the vision input
+            # contract. _encode_frame can raise on degenerate inputs;
+            # the broad catch below collapses every body-construction
+            # failure to False rather than letting it escape into the
+            # orchestrator's startup sequence.
+            tiny_frame = np.zeros((1, 1, 3), dtype=np.uint8)
+            body = {
+                "model": self._config.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "warmup",
+                        "images": [_encode_frame(tiny_frame)],
+                    }
+                ],
+                "stream": False,
+                "keep_alive": self._config.keep_alive,
+            }
             response = self._session.post(
                 self._chat_url,
                 json=body,
-                timeout=self._timeout_s,
+                timeout=self._warmup_timeout_s,
             )
-        except requests.Timeout:
-            logger.warning("inference_warmup_timeout host=%s", self._chat_url)
-            return False
-        except requests.ConnectionError:
-            logger.warning(
-                "inference_warmup_connection_refused host=%s", self._chat_url
-            )
-            return False
         except requests.RequestException as exc:
-            logger.warning("inference_warmup_error host=%s err=%s", self._chat_url, exc)
+            logger.warning(
+                "inference_warmup_request_error host=%s err_type=%s err=%s",
+                self._chat_url,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        except Exception as exc:  # noqa: BLE001 - intentional broad catch
+            # Defensive: cv2.error, ValueError, TypeError, anything raised
+            # during body construction. Collapsing to False here keeps
+            # warmup honest with its documented contract.
+            logger.warning(
+                "inference_warmup_unexpected_error err_type=%s err=%s",
+                type(exc).__name__,
+                exc,
+            )
             return False
 
         if response.status_code != 200:
@@ -257,16 +345,20 @@ class InferenceEngine:
 
         Drops the call immediately (returns ``None``) if another inference
         is already in flight on this engine — the stale-frame policy is
-        better than queuing because LLM calls take 5-8s and the next frame
+        better than queuing because LLM calls take 5-8 s and the next frame
         is more useful than the old one.
 
-        Returns ``None`` on:
+        Returns ``None`` on every failure mode and never raises:
         * lock contention (single-worker drop)
-        * network timeout
-        * connection refused
+        * any ``requests.RequestException`` subtype (Timeout, ConnectionError,
+          SSLError, InvalidURL, ChunkedEncodingError, etc.)
         * HTTP non-200
-        * malformed response envelope
+        * malformed response envelope (invalid JSON, non-dict top-level,
+          missing or non-string ``message.content``)
         * malformed response content (parser failure)
+        * unexpected errors during body construction (``cv2.error`` on a
+          degenerate frame, ``ValueError`` from a non-numeric ``EventTime``
+          in ``state.riot_events``, etc.)
 
         The orchestrator (Unit 10) inspects the return value and tracks
         consecutive ``None`` results for the timeout-escalation ladder.
@@ -288,36 +380,52 @@ class InferenceEngine:
         state: GameState,
         detections: DetectionResult,
     ) -> Callout | None:
-        body = {
-            "model": self._config.model,
-            "messages": [
-                {"role": "system", "content": build_system_prompt()},
-                {
-                    "role": "user",
-                    "content": build_user_prompt(state, detections),
-                    "images": [_encode_frame(frame)],
-                },
-            ],
-            "stream": False,
-            "keep_alive": self._config.keep_alive,
-        }
         try:
+            # Body construction lives inside the try so any error in
+            # _encode_frame (cv2.error on degenerate frames) or in
+            # build_user_prompt (e.g. non-numeric EventTime in
+            # state.riot_events) collapses to None instead of escaping
+            # into the orchestrator's worker thread. The docstring
+            # contract on run() promises every failure mode returns
+            # None — this is what enforces it.
+            body = {
+                "model": self._config.model,
+                "messages": [
+                    {"role": "system", "content": build_system_prompt()},
+                    {
+                        "role": "user",
+                        "content": build_user_prompt(state, detections),
+                        "images": [_encode_frame(frame)],
+                    },
+                ],
+                "stream": False,
+                "keep_alive": self._config.keep_alive,
+            }
             response = self._session.post(
                 self._chat_url,
                 json=body,
                 timeout=self._timeout_s,
             )
-        except requests.Timeout:
-            logger.warning("inference_timeout host=%s", self._chat_url)
-            return None
-        except requests.ConnectionError:
+        except requests.RequestException as exc:
+            # Single branch covering Timeout, ConnectionError, SSLError,
+            # InvalidURL, ChunkedEncodingError, etc. The exception class
+            # name carries the failure mode for log triage.
             logger.warning(
-                "inference_connection_refused host=%s", self._chat_url
+                "inference_request_error host=%s err_type=%s err=%s",
+                self._chat_url,
+                type(exc).__name__,
+                exc,
             )
             return None
-        except requests.RequestException as exc:
+        except Exception as exc:  # noqa: BLE001 - intentional broad catch
+            # Defensive: cv2.error from _encode_frame, ValueError from
+            # _format_objectives/_format_kill_feed on bad EventTime, or
+            # anything else that escapes body construction. Returning
+            # None keeps the orchestrator's None-counter ladder honest.
             logger.warning(
-                "inference_request_error host=%s err=%s", self._chat_url, exc
+                "inference_unexpected_error err_type=%s err=%s",
+                type(exc).__name__,
+                exc,
             )
             return None
 
@@ -330,9 +438,16 @@ class InferenceEngine:
             return None
 
         try:
-            envelope: dict[str, Any] = response.json()
+            envelope: Any = response.json()
         except ValueError:
             logger.warning("inference_envelope_invalid_json")
+            return None
+
+        if not isinstance(envelope, dict):
+            logger.warning(
+                "inference_envelope_not_dict type=%s",
+                type(envelope).__name__,
+            )
             return None
 
         message = envelope.get("message") or {}

@@ -34,6 +34,7 @@ Concurrency:
 
 from __future__ import annotations
 
+import dataclasses
 import threading
 
 import numpy as np
@@ -46,8 +47,14 @@ from lolcoach.detector import ChampionDetection, DetectionResult
 from lolcoach.inference import Callout, InferenceEngine, _parse_response
 from lolcoach.state import GameState
 from tests.fixtures.ollama_responses import (
+    CONFIDENCE_FRACTIONAL,
+    CONFIDENCE_LOWER_BOUND,
+    CONFIDENCE_NEGATIVE,
     CONFIDENCE_NOT_INTEGER,
     CONFIDENCE_OUT_OF_RANGE,
+    CONFIDENCE_UPPER_BOUND,
+    CONFIDENCE_ZERO,
+    DUPLICATE_DECISION,
     EMPTY_DECISION,
     GARBAGE_RESPONSE,
     MALFORMED_NO_CATEGORY,
@@ -192,6 +199,49 @@ def test_parse_response_empty_string_returns_none() -> None:
     assert _parse_response("") is None
 
 
+def test_parse_response_confidence_lower_bound_parses() -> None:
+    """CONFIDENCE: 1 is the documented lower boundary — must parse."""
+    callout = _parse_response(CONFIDENCE_LOWER_BOUND)
+    assert callout is not None
+    assert callout.confidence == 1
+
+
+def test_parse_response_confidence_upper_bound_parses() -> None:
+    """CONFIDENCE: 10 is the documented upper boundary — must parse."""
+    callout = _parse_response(CONFIDENCE_UPPER_BOUND)
+    assert callout is not None
+    assert callout.confidence == 10
+
+
+def test_parse_response_confidence_zero_returns_none() -> None:
+    """CONFIDENCE: 0 is below the [1, 10] range — must reject."""
+    assert _parse_response(CONFIDENCE_ZERO) is None
+
+
+def test_parse_response_confidence_negative_returns_none() -> None:
+    """CONFIDENCE: -3 parses as int but fails the range gate."""
+    assert _parse_response(CONFIDENCE_NEGATIVE) is None
+
+
+def test_parse_response_confidence_fractional_returns_none() -> None:
+    """CONFIDENCE: 8.5 raises ValueError on int() — must collapse to None,
+    not crash. Real failure mode the fixture module documents but the
+    original test suite did not exercise.
+    """
+    assert _parse_response(CONFIDENCE_FRACTIONAL) is None
+
+
+def test_parse_response_duplicate_decision_keeps_first_match() -> None:
+    """Pin the first-match-wins semantics so a future refactor to
+    "last wins" or "reject duplicates" would break this test rather
+    than silently change parser behavior. Real failure mode: the model
+    self-corrects mid-stream and emits a second DECISION below the first.
+    """
+    callout = _parse_response(DUPLICATE_DECISION)
+    assert callout is not None
+    assert callout.decision == "Path to bot river"
+
+
 # ---------------------------------------------------------------------------
 # Callout dataclass invariants
 # ---------------------------------------------------------------------------
@@ -204,8 +254,84 @@ def test_callout_is_frozen_dataclass() -> None:
         reason="Low HP, full inventory",
         generated_at=1000.0,
     )
-    with pytest.raises((AttributeError, Exception)):
+    # FrozenInstanceError is the precise contract — a tuple of
+    # (AttributeError, Exception) would silently accept any non-base
+    # exception, defeating the test if frozen=True ever drops off.
+    with pytest.raises(dataclasses.FrozenInstanceError):
         callout.confidence = 10  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# InferenceEngine.__init__ — construction-time validation
+# ---------------------------------------------------------------------------
+def test_init_rejects_zero_timeout_ms() -> None:
+    """timeout_ms <= 0 would make every requests.post raise ValueError
+    mid-game. Fail-fast at construction matches the riot_client pattern."""
+    config = InferenceConfig(timeout_ms=0)
+    with pytest.raises(ValueError, match="timeout_ms"):
+        InferenceEngine(config=config)
+
+
+def test_init_rejects_negative_timeout_ms() -> None:
+    config = InferenceConfig(timeout_ms=-1)
+    with pytest.raises(ValueError, match="timeout_ms"):
+        InferenceEngine(config=config)
+
+
+def test_init_rejects_non_loopback_ollama_host() -> None:
+    """Sending the prompt + minimap to a remote URL would exfiltrate
+    summoner names, kill feed, and the live screenshot to that server.
+    The check matches riot_client._assert_loopback_base_url and is
+    enforced at construction so the failure mode is impossible.
+    """
+    config = InferenceConfig(ollama_host="http://attacker.example.com:11434")
+    with pytest.raises(ValueError, match="loopback"):
+        InferenceEngine(config=config)
+
+
+def test_init_rejects_public_ip_ollama_host() -> None:
+    config = InferenceConfig(ollama_host="http://8.8.8.8:11434")
+    with pytest.raises(ValueError, match="loopback"):
+        InferenceEngine(config=config)
+
+
+def test_init_rejects_ollama_host_without_hostname() -> None:
+    config = InferenceConfig(ollama_host="http://:11434")
+    with pytest.raises(ValueError, match="hostname"):
+        InferenceEngine(config=config)
+
+
+def test_init_accepts_localhost_alias() -> None:
+    """The literal hostname 'localhost' resolves at runtime — accept it
+    as effectively loopback for any sane system, matching riot_client.
+    """
+    config = InferenceConfig(ollama_host="http://localhost:11434")
+    InferenceEngine(config=config)  # must not raise
+
+
+def test_init_accepts_127_0_0_1() -> None:
+    config = InferenceConfig(ollama_host="http://127.0.0.1:11434")
+    InferenceEngine(config=config)  # must not raise
+
+
+def test_init_accepts_ipv6_loopback() -> None:
+    config = InferenceConfig(ollama_host="http://[::1]:11434")
+    InferenceEngine(config=config)  # must not raise
+
+
+def test_init_warmup_timeout_floors_at_30s_when_per_frame_is_lower() -> None:
+    """The plan documents 10-20 s cold-start model loading, so warmup
+    needs a longer timeout than the per-frame budget. Verify the floor
+    is applied even when timeout_ms is small."""
+    engine = _make_engine(timeout_ms=5_000)  # 5 s per frame
+    assert engine._warmup_timeout_s >= 30.0  # noqa: SLF001 — testing internal
+
+
+def test_init_warmup_timeout_uses_per_frame_when_per_frame_is_higher() -> None:
+    """If timeout_ms is set higher than 30 s, use the configured value
+    rather than the floor — operators may want a slow but generous gate."""
+    engine = _make_engine(timeout_ms=60_000)
+    assert engine._warmup_timeout_s == 60.0  # noqa: SLF001 — testing internal
 
 
 # ---------------------------------------------------------------------------
@@ -345,10 +471,10 @@ def test_run_invalid_json_response_body_returns_none() -> None:
 
 def test_run_generic_request_exception_returns_none() -> None:
     """Defense-in-depth: any ``requests.RequestException`` subtype other
-    than the explicitly-handled Timeout/ConnectionError (e.g. ``InvalidURL``,
-    ``ChunkedEncodingError``, malformed proxy responses) must collapse to
-    None. ``SSLError`` is intentionally not used here because it inherits
-    from ``ConnectionError`` and would hit the wrong branch.
+    than Timeout/ConnectionError (``InvalidURL``, ``ChunkedEncodingError``,
+    malformed proxy responses) must collapse to None. The collapsed
+    catch logs the exception class name so an operator can triage which
+    subtype fired.
     """
     engine = _make_engine()
     with rm_module.Mocker() as m:
@@ -356,6 +482,92 @@ def test_run_generic_request_exception_returns_none() -> None:
         result = engine.run(
             frame=_fake_frame(),
             state=_make_state(),
+            detections=_make_detections(),
+        )
+    assert result is None
+
+
+def test_run_envelope_non_dict_top_level_returns_none() -> None:
+    """A 200 response whose JSON top-level is null/list/string crashes on
+    envelope.get(...) without an isinstance guard. Defensive against
+    Ollama version drift or a misconfigured proxy.
+    """
+    engine = _make_engine()
+    with rm_module.Mocker() as m:
+        m.post(OLLAMA_CHAT_URL, json=["not", "a", "dict"])
+        result = engine.run(
+            frame=_fake_frame(),
+            state=_make_state(),
+            detections=_make_detections(),
+        )
+    assert result is None
+
+
+def test_run_with_degenerate_frame_returns_none_does_not_raise() -> None:
+    """``cv2.imencode(".png", frame)`` raises ``cv2.error`` for None,
+    wrong dtype, or zero-dimension frames. Without the body-hoist fix,
+    that exception escapes ``run()`` and crashes the inference worker
+    (R7 violation). Verify run() collapses to None instead.
+    """
+    engine = _make_engine()
+    bad_frame: np.ndarray = np.zeros((0, 0, 3), dtype=np.uint8)
+    with rm_module.Mocker() as m:
+        m.post(OLLAMA_CHAT_URL, json=_wrap(VALID_RESPONSE))
+        # cv2.imencode on a 0x0 frame succeeds in some opencv builds and
+        # raises in others. Force the failure path explicitly via a
+        # frame that is structurally invalid for PNG encoding.
+        result = engine.run(
+            frame=bad_frame,
+            state=_make_state(),
+            detections=_make_detections(),
+        )
+    # Either result must be valid (encoder succeeded) OR None (encoder
+    # failed and the broad catch collapsed it). Crucially, run() must
+    # NOT raise. We assert no exception escaped by reaching this line.
+    assert result is None or isinstance(result, Callout)
+
+
+def test_run_with_none_frame_returns_none_does_not_raise() -> None:
+    """A None frame is the most common 'degenerate' case in production —
+    the orchestrator could pass None on a capture-loss tick before the
+    capture-exhausted escalation kicks in. Must collapse to None, not
+    raise into the worker thread.
+    """
+    engine = _make_engine()
+    with rm_module.Mocker() as m:
+        m.post(OLLAMA_CHAT_URL, json=_wrap(VALID_RESPONSE))
+        result = engine.run(
+            frame=None,  # type: ignore[arg-type]
+            state=_make_state(),
+            detections=_make_detections(),
+        )
+    assert result is None
+
+
+def test_run_with_non_numeric_event_time_in_state_returns_none() -> None:
+    """If state.riot_events carries a non-numeric ``EventTime`` (Riot API
+    drift, cosmic ray, etc.), ``_format_objectives`` raises ValueError on
+    ``float(...)``. Without the body-hoist fix that escapes through
+    ``run()``. Must collapse to None.
+    """
+    engine = _make_engine()
+    state = GameState(
+        game_time_seconds=600.0,
+        active_summoner_name="ActivePlayer#NA1",
+        active_player_champion="Hecarim",
+        riot_events=(
+            {
+                "EventID": 4,
+                "EventName": "DragonKill",
+                "EventTime": "not-a-number",  # corrupt EventTime
+            },
+        ),
+    )
+    with rm_module.Mocker() as m:
+        m.post(OLLAMA_CHAT_URL, json=_wrap(VALID_RESPONSE))
+        result = engine.run(
+            frame=_fake_frame(),
+            state=state,
             detections=_make_detections(),
         )
     assert result is None
@@ -406,6 +618,49 @@ def test_warmup_generic_request_exception_returns_false() -> None:
     with rm_module.Mocker() as m:
         m.post(OLLAMA_CHAT_URL, exc=requests.exceptions.InvalidURL)
         assert engine.warmup() is False
+
+
+def test_warmup_collapses_encode_frame_failure_to_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ``cv2.imencode`` returns ``(False, ...)`` (some opencv builds
+    fail this way instead of raising), ``_encode_frame`` raises
+    ``RuntimeError``. The warmup broad-except must collapse it to False
+    rather than letting it escape into the orchestrator's startup
+    sequence. This test exercises both the
+    ``if not success: raise RuntimeError`` branch in ``_encode_frame``
+    and the ``except Exception`` broad catch in ``warmup``.
+    """
+    import cv2
+
+    monkeypatch.setattr(cv2, "imencode", lambda ext, img: (False, b""))
+
+    engine = _make_engine()
+    assert engine.warmup() is False
+
+
+def test_warmup_uses_longer_timeout_than_per_frame() -> None:
+    """The plan documents 10-20 s cold-start model loading. Verify warmup
+    uses ``self._warmup_timeout_s`` (floor 30 s), not the per-frame
+    ``self._timeout_s``. We capture the timeout argument by patching
+    the session's post method since requests-mock does not expose the
+    ``timeout`` kwarg.
+    """
+    captured: dict[str, float] = {}
+
+    def fake_post(url: str, **kwargs: object) -> requests.Response:
+        captured["timeout"] = float(kwargs.get("timeout") or 0.0)
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"message": {"content": "ok"}}'
+        return response
+
+    engine = _make_engine(timeout_ms=5_000)  # 5 s per-frame
+    engine._session.post = fake_post  # type: ignore[method-assign]  # noqa: SLF001
+    assert engine.warmup() is True
+    assert captured["timeout"] >= 30.0, (
+        "warmup must use the 30s floor, not the 5s per-frame timeout"
+    )
 
 
 # ---------------------------------------------------------------------------
