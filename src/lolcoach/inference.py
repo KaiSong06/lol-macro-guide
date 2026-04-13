@@ -70,19 +70,39 @@ _MAX_CONFIDENCE = 10
 #: stays tight to the 8 s latency budget.
 _WARMUP_MIN_TIMEOUT_S = 30.0
 
+#: Set of known field keys. Used both for per-field regex construction
+#: and for the boundary lookahead that terminates each field's value.
+_FIELD_KEYS: tuple[str, ...] = (
+    "DECISION",
+    "CATEGORY",
+    "TARGET_LANE",
+    "CONFIDENCE",
+    "REASON",
+)
+
+#: Lookahead that terminates a field's value at the next known key at line
+#: start, or at end of text. Lets each captured value span multiple lines
+#: so a wrapped REASON or DECISION keeps its continuation content. Without
+#: this, a multi-line REASON would silently drop everything after the first
+#: physical line — and the DecisionFilter (Unit 8) would then see a
+#: truncated REASON and miss champion names in the dropped content (R6
+#: precondition violation).
+_KEY_BOUNDARY = (
+    r"(?=\n[ \t]*(?:" + "|".join(_FIELD_KEYS) + r")[ \t]*:|\Z)"
+)
+
 #: Per-field regex — anchored on the field key with optional horizontal
-#: whitespace only (``[ \t]*`` not ``\s*``, so the engine cannot eat newlines
-#: and slurp the next line into the captured value). ``re.MULTILINE`` makes
-#: ``^`` and ``$`` bind to line boundaries instead of string boundaries, so
-#: each pattern matches one logical "KEY: value" line independently of order.
+#: whitespace before the colon. Captures the value non-greedily from the
+#: colon to the next known key at line start (or end of text), with
+#: ``re.DOTALL`` so ``.`` crosses newlines. ``re.MULTILINE`` keeps ``^``
+#: bound to line starts. First-match-wins semantics preserved via
+#: ``pattern.search`` at call time.
 _FIELD_RE: dict[str, re.Pattern[str]] = {
-    "decision": re.compile(r"^[ \t]*DECISION[ \t]*:[ \t]*(.*)$", re.MULTILINE),
-    "category": re.compile(r"^[ \t]*CATEGORY[ \t]*:[ \t]*(.*)$", re.MULTILINE),
-    "target_lane": re.compile(
-        r"^[ \t]*TARGET_LANE[ \t]*:[ \t]*(.*)$", re.MULTILINE
-    ),
-    "confidence": re.compile(r"^[ \t]*CONFIDENCE[ \t]*:[ \t]*(.*)$", re.MULTILINE),
-    "reason": re.compile(r"^[ \t]*REASON[ \t]*:[ \t]*(.*)$", re.MULTILINE),
+    key.lower(): re.compile(
+        rf"^[ \t]*{key}[ \t]*:[ \t]*(.*?){_KEY_BOUNDARY}",
+        re.MULTILINE | re.DOTALL,
+    )
+    for key in _FIELD_KEYS
 }
 
 

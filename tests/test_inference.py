@@ -58,6 +58,9 @@ from tests.fixtures.ollama_responses import (
     EMPTY_DECISION,
     GARBAGE_RESPONSE,
     MALFORMED_NO_CATEGORY,
+    MULTILINE_REASON,
+    OUT_OF_ORDER_WITH_MULTILINE_REASON,
+    REASON_WITH_EMBEDDED_KEY_ON_CONTINUATION,
     TRAILING_WHITESPACE,
     UNKNOWN_CATEGORY,
     UNKNOWN_LANE,
@@ -240,6 +243,68 @@ def test_parse_response_duplicate_decision_keeps_first_match() -> None:
     callout = _parse_response(DUPLICATE_DECISION)
     assert callout is not None
     assert callout.decision == "Path to bot river"
+
+
+def test_parse_response_multiline_reason_captures_all_continuation_lines() -> None:
+    """The R6 precondition: Unit 8's grounding check must see every
+    champion name the model mentions in REASON. A truncated REASON
+    silently drops champion names and the filter cannot reject a
+    hallucinated callout whose evidence was discarded by the parser.
+
+    Fix verification: REASON should capture all three continuation lines
+    (including the second and third mentions of champion names) up to
+    end of text.
+    """
+    callout = _parse_response(MULTILINE_REASON)
+
+    assert callout is not None
+    assert "Lee Sin" in callout.reason
+    assert "Yasuo" in callout.reason  # the dropped-without-fix case
+    assert "defensively" in callout.reason  # third line reaches EOF
+
+
+def test_parse_response_out_of_order_multiline_reason_parses_cleanly() -> None:
+    """REASON appears first and wraps across lines. The boundary lookahead
+    must terminate REASON at the next known key at line start, NOT at
+    arbitrary text in the continuation. Every other field must still be
+    extracted from its own line below REASON.
+    """
+    callout = _parse_response(OUT_OF_ORDER_WITH_MULTILINE_REASON)
+
+    assert callout is not None
+    # REASON spans both lines before CONFIDENCE.
+    assert "Enemy was last seen near top lane" in callout.reason
+    assert "Predicted path loops through the river" in callout.reason
+    # The key lines that follow REASON are still extracted correctly.
+    assert callout.confidence == 8
+    assert callout.category == "pathing"
+    assert callout.target_lane == "top"
+    assert callout.decision == "Rotate top to contest"
+
+
+def test_parse_response_reason_terminates_at_key_lookalike_continuation() -> None:
+    """If a REASON continuation line literally starts with a known key,
+    the boundary lookahead terminates REASON there and the (duplicate)
+    key line's value is extracted as that field. In this fixture the
+    second CONFIDENCE line is "high as I can tell" — not an integer —
+    so first-match-wins gives CONFIDENCE=8 (the real value) and the
+    adversarial line is harmless.
+
+    Without the boundary lookahead, REASON would silently capture
+    "Lee Sin is pathing" only and drop the continuation; with it, the
+    parser behaves consistently whether REASON has continuations or
+    not.
+    """
+    callout = _parse_response(REASON_WITH_EMBEDDED_KEY_ON_CONTINUATION)
+
+    # The real CONFIDENCE=8 on line 4 is matched first (re.search returns
+    # the first match), so the parsed Callout is valid.
+    assert callout is not None
+    assert callout.confidence == 8
+    # REASON should capture only up to the line-starting CONFIDENCE
+    # lookalike — nothing after it.
+    assert "Lee Sin is pathing" in callout.reason
+    assert "high as I can tell" not in callout.reason
 
 
 # ---------------------------------------------------------------------------

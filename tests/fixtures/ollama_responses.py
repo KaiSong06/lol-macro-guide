@@ -174,6 +174,55 @@ DUPLICATE_DECISION = (
     "DECISION: Actually wait at top river\n"
 )
 
+#: REASON wraps across multiple physical lines. The parser must capture
+#: all of them (up to the next known key or end of text) so Unit 8's
+#: grounding check sees every champion name the model mentioned. A
+#: truncated REASON is an R6 precondition violation: the filter can't
+#: reject a hallucinated champion whose name was silently dropped by
+#: the parser. Real failure mode: small 4B-scale vision models emit
+#: wrapped REASON text when the thought spans more than one clause.
+MULTILINE_REASON = (
+    "DECISION: Path to bot river, Lee Sin likely ganking top\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: bot\n"
+    "CONFIDENCE: 8\n"
+    "REASON: Lee Sin was last seen near bot river 30s ago.\n"
+    "Yasuo is pushing top and could dive.\n"
+    "Both are reasons to path defensively.\n"
+)
+
+#: Out-of-order response (REASON first) where REASON wraps across multiple
+#: lines. None of the continuation lines start with a known key, so the
+#: parser should capture the full wrapped text for REASON and still pull
+#: each of the other fields correctly when their key lines appear below.
+#: This verifies the boundary lookahead does not false-positive on
+#: arbitrary text inside a multi-line value.
+OUT_OF_ORDER_WITH_MULTILINE_REASON = (
+    "REASON: Enemy was last seen near top lane.\n"
+    "Predicted path loops through the river.\n"
+    "CONFIDENCE: 8\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: top\n"
+    "DECISION: Rotate top to contest\n"
+)
+
+#: Adversarial regression: a REASON that wraps across multiple lines AND
+#: one of the continuation lines happens to start with a literal known
+#: key. The boundary lookahead terminates REASON at that continuation
+#: line, and the (duplicate) key line's value gets extracted as a
+#: separate field. In this fixture the duplicate CONFIDENCE is a
+#: non-integer, which fails the int() conversion — parser returns None
+#: instead of silently accepting a wrong value. Real failure mode:
+#: model self-narration leaks field-key-lookalike lines mid-reason.
+REASON_WITH_EMBEDDED_KEY_ON_CONTINUATION = (
+    "DECISION: Path to bot\n"
+    "CATEGORY: pathing\n"
+    "TARGET_LANE: bot\n"
+    "CONFIDENCE: 8\n"
+    "REASON: Lee Sin is pathing\n"
+    "CONFIDENCE: high as I can tell\n"
+)
+
 #: Empty DECISION line. Even if every other field parses, an empty
 #: decision is unspeakable — TTS would broadcast silence. Reject.
 EMPTY_DECISION = (
