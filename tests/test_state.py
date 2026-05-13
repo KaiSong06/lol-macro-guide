@@ -46,6 +46,8 @@ def test_fresh_state_manager_has_cold_start_defaults() -> None:
 
     assert isinstance(snap, GameState)
     assert snap.game_time_seconds == 0.0
+    assert snap.active_player_champion is None
+    assert snap.active_player_gold is None
     assert snap.enemy_jungler_last_seen is None
     assert snap.enemy_jungler_predicted_quadrant is None
     assert snap.all_champions == frozenset()
@@ -60,6 +62,8 @@ def test_update_from_riot_populates_fields() -> None:
     snap = sm.snapshot()
     assert snap.game_time_seconds == 742.5
     assert snap.active_summoner_name == "ActivePlayer#NA1"
+    assert snap.active_player_champion == "Hecarim"
+    assert snap.active_player_gold == 3200
     assert "Hecarim" in snap.ally_champions
     assert "Jinx" in snap.ally_champions
     assert "LeeSin" in snap.enemy_champions
@@ -70,10 +74,54 @@ def test_update_from_riot_populates_fields() -> None:
     assert snap.enemy_jungler_champion_name == "LeeSin"
 
 
+def test_update_from_riot_missing_currentgold_keeps_field_none() -> None:
+    """Older Live Client Data API versions sometimes omit ``currentGold`` from
+    the ``activePlayer`` block. The state manager treats it as a soft field and
+    leaves it as ``None`` rather than crashing or defaulting to zero (which
+    would mislead the prompt builder into telling the LLM the player is broke).
+    """
+    sm = StateManager()
+    data = _load_fixture("allgamedata_ingame.json")
+    del data["activePlayer"]["currentGold"]
+    sm.update_from_riot(data)
+
+    snap = sm.snapshot()
+    assert snap.active_player_gold is None
+    # Champion is still present — only currentGold was stripped.
+    assert snap.active_player_champion == "Hecarim"
+
+
+def test_update_from_riot_non_numeric_currentgold_keeps_field_none() -> None:
+    """If Riot returns a non-numeric currentGold (string, null, dict — should
+    never happen, but external data is external data), the state manager
+    coerces gracefully to None rather than raising.
+    """
+    sm = StateManager()
+    data = _load_fixture("allgamedata_ingame.json")
+    data["activePlayer"]["currentGold"] = "not-a-number"
+    sm.update_from_riot(data)
+
+    assert sm.snapshot().active_player_gold is None
+
+
 def test_update_from_detector_sets_enemy_jungler_last_seen() -> None:
+    """``update_from_detector`` stores last_seen as
+    ``(quadrant, game_time_seconds)`` — the game-clock at the moment of
+    the state update, NOT the wall-clock ``detected_at`` from the
+    DetectionResult. This is the fix for the R6 precondition bug where
+    the prompt builder computed age as ``game_time_seconds - wall_clock_ts``
+    and silently clamped every callout's "~Ns ago" to ~0s.
+
+    The ``detected_at`` field on DetectionResult remains wall-clock for
+    other consumers (capture→inference staleness tracking, log records);
+    only the state manager's *stored* last_seen has shifted base.
+    """
     sm = StateManager()
     data = _load_fixture("allgamedata_ingame.json")
     sm.update_from_riot(data)
+    # Fixture sets game_time to 742.5s — that's what last_seen should
+    # carry, not the detector's wall-clock detected_at below.
+    assert sm.snapshot().game_time_seconds == 742.5
 
     detection = DetectionResult(
         champions=(
@@ -85,7 +133,7 @@ def test_update_from_detector_sets_enemy_jungler_last_seen() -> None:
                 confidence=0.91,
             ),
         ),
-        detected_at=1712750000.0,
+        detected_at=1712750000.0,  # wall-clock — intentionally ignored
     )
     sm.update_from_detector(detection)
 
@@ -93,7 +141,9 @@ def test_update_from_detector_sets_enemy_jungler_last_seen() -> None:
     assert snap.enemy_jungler_last_seen is not None
     quad, ts = snap.enemy_jungler_last_seen
     assert quad == "bot_jungle"
-    assert ts == 1712750000.0
+    # Game-clock, matching game_time_seconds at the moment of
+    # update_from_detector — NOT the DetectionResult.detected_at.
+    assert ts == 742.5
 
 
 def test_snapshot_is_independent_of_stored_state() -> None:
@@ -188,6 +238,8 @@ def test_reset_clears_everything() -> None:
 
     snap = sm.snapshot()
     assert snap.game_time_seconds == 0.0
+    assert snap.active_player_champion is None
+    assert snap.active_player_gold is None
     assert snap.all_champions == frozenset()
     assert snap.ally_champions == frozenset()
     assert snap.enemy_champions == frozenset()
@@ -353,13 +405,13 @@ def test_snapshot_predicted_quadrant_is_none_at_cold_start() -> None:
 
 
 def test_snapshot_predicted_quadrant_after_detection() -> None:
-    import time as _time
-
     sm = StateManager()
     sm.update_from_riot(_load_fixture("allgamedata_ingame.json"))
-    # detected_at must be close to the current wall clock so that snapshot's
-    # ``time.time() - ts`` is small (under 30s) and predict_quadrant returns
-    # the last-seen quadrant unchanged.
+    # update_from_detector now stores (quadrant, game_time_seconds) —
+    # wall-clock detected_at is ignored for the last_seen storage path.
+    # game_time_seconds just got set to 742.5 by the Riot update above,
+    # so snapshot's elapsed = 742.5 - 742.5 = 0s → predict_quadrant
+    # returns the last-seen quadrant unchanged.
     sm.update_from_detector(
         DetectionResult(
             champions=(
@@ -371,7 +423,7 @@ def test_snapshot_predicted_quadrant_after_detection() -> None:
                     confidence=0.9,
                 ),
             ),
-            detected_at=_time.time() - 5.0,  # 5 seconds ago
+            detected_at=0.0,  # ignored by update_from_detector; kept for DetectionResult contract
         )
     )
     snap = sm.snapshot()

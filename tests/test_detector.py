@@ -177,19 +177,24 @@ def test_detect_drops_matches_below_confidence_threshold() -> None:
 # ---------------------------------------------------------------------------
 # Unknown champion (not in rosters) dropped with log
 # ---------------------------------------------------------------------------
-def test_detect_drops_champion_not_in_either_roster(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
+def test_detect_does_not_return_champion_outside_the_roster() -> None:
+    """After F2, the detector doesn't even run matchTemplate against
+    templates whose names aren't in the roster. The previous
+    implementation matched all templates and filtered after (with a
+    'dropping unknown champion' INFO log); the log path is now dead
+    code because the non-roster iteration never happens.
+
+    The externally-observable behavior is the same: an Ekko detection
+    is not returned when Ekko isn't in ally_names or enemy_names.
+    """
     detector = Detector(FIXTURE_TEMPLATE_DIR)
 
     frame = np.full((512, 512, 3), 50, dtype=np.uint8)
     _embed(frame, _load_template("Ekko"), top_left=(200, 200))
 
-    with caplog.at_level(logging.INFO, logger="lolcoach.detector"):
-        result = detector.detect(frame, ally_names=["Jinx"], enemy_names=["LeeSin"])
+    result = detector.detect(frame, ally_names=["Jinx"], enemy_names=["LeeSin"])
 
     assert all(c.name != "Ekko" for c in result.champions)
-    assert any("ekko" in rec.message.lower() for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -248,3 +253,102 @@ def test_detect_skips_template_larger_than_frame() -> None:
     tiny_frame = np.full((10, 10, 3), 50, dtype=np.uint8)
     result = detector.detect(tiny_frame, ally_names=["LeeSin"], enemy_names=[])
     assert result.champions == ()
+
+
+# ---------------------------------------------------------------------------
+# F2 regression: matchTemplate runs only for in-roster champions
+# ---------------------------------------------------------------------------
+def test_detect_only_runs_matchtemplate_for_roster_champions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hot path must NOT run cv2.matchTemplate against every loaded
+    template. With ~160 League champions but only 10 playing any given
+    match, filtering by roster before the matchTemplate loop yields a
+    ~16x speedup on the capture hot path (F2 from /ce:review).
+
+    This test patches cv2.matchTemplate with a call counter and asserts
+    exactly len(roster) calls, not len(all_templates).
+    """
+    import cv2 as real_cv2
+
+    detector = Detector(FIXTURE_TEMPLATE_DIR)
+    # The fixture templates are {LeeSin, Jinx, Hecarim, Ekko, Ahri}.
+    assert detector.known_champions == ALL_TEMPLATE_NAMES
+    assert len(detector.known_champions) == 5
+
+    calls: list[str] = []
+    original_match = real_cv2.matchTemplate
+
+    def counting_match(frame, template, method):
+        # Best-effort identify which template this is by shape fingerprint.
+        calls.append(f"shape={template.shape}")
+        return original_match(frame, template, method)
+
+    monkeypatch.setattr(real_cv2, "matchTemplate", counting_match)
+
+    frame = np.full((512, 512, 3), 50, dtype=np.uint8)
+    detector.detect(
+        frame,
+        ally_names=["Jinx"],  # 1 ally in roster
+        enemy_names=["LeeSin"],  # 1 enemy in roster
+    )
+
+    # Exactly 2 matchTemplate calls — one per roster entry — NOT 5
+    # (which would be "matched all templates then filtered after").
+    assert len(calls) == 2, (
+        f"Expected 2 matchTemplate calls (roster size), got {len(calls)}. "
+        f"The detector is still running matchTemplate against non-roster "
+        f"templates — the F2 hot-path optimization is not in effect."
+    )
+
+
+def test_detect_handles_roster_champion_with_missing_template(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If the Riot roster includes a champion whose template didn't load
+    (e.g., a brand new champion released after the last
+    build-champion-templates.py run), the detector must skip gracefully
+    without crashing and without affecting other champions.
+    """
+    detector = Detector(FIXTURE_TEMPLATE_DIR)
+
+    frame = np.full((512, 512, 3), 50, dtype=np.uint8)
+    _embed(frame, _load_template("LeeSin"), top_left=(100, 100))
+
+    # "NewChampion2026" has no template loaded; LeeSin does.
+    result = detector.detect(
+        frame,
+        ally_names=[],
+        enemy_names=["LeeSin", "NewChampion2026"],
+    )
+
+    # LeeSin should still be detected.
+    assert any(c.name == "LeeSin" for c in result.champions)
+    # No crash. NewChampion2026 simply doesn't appear.
+    assert all(c.name != "NewChampion2026" for c in result.champions)
+
+
+def test_detect_with_all_rostered_champions_runs_all_matches() -> None:
+    """Baseline sanity: if the roster contains every loaded template,
+    every template should be matched. This pairs with the filter test
+    above — together they prove the count IS len(roster), not
+    min(len(roster), len(templates)) or some other quirk.
+    """
+    detector = Detector(FIXTURE_TEMPLATE_DIR)
+
+    frame = np.full((512, 512, 3), 50, dtype=np.uint8)
+    # Put every fixture template into the frame at non-overlapping positions
+    _embed(frame, _load_template("LeeSin"), top_left=(50, 50))
+    _embed(frame, _load_template("Jinx"), top_left=(150, 50))
+    _embed(frame, _load_template("Hecarim"), top_left=(250, 50))
+    _embed(frame, _load_template("Ekko"), top_left=(50, 150))
+    _embed(frame, _load_template("Ahri"), top_left=(150, 150))
+
+    result = detector.detect(
+        frame,
+        ally_names=["Jinx", "Hecarim", "Ahri"],
+        enemy_names=["LeeSin", "Ekko"],
+    )
+
+    found_names = {c.name for c in result.champions}
+    assert found_names == ALL_TEMPLATE_NAMES

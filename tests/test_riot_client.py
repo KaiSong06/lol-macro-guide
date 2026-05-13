@@ -549,3 +549,392 @@ def test_is_jungle_role_false_for_top_lane() -> None:
 
 def test_is_jungle_role_handles_missing_fields() -> None:
     assert _is_jungle_role({}) is False
+
+
+# ---------------------------------------------------------------------------
+# F4 regression: verify=False must be scoped to loopback only
+# ---------------------------------------------------------------------------
+def test_riot_client_accepts_127_0_0_1_base_url() -> None:
+    config = RiotApiConfig(base_url="https://127.0.0.1:2999")
+    client = RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+    assert client.state == LifecycleState.IDLE
+
+
+def test_riot_client_accepts_localhost_base_url() -> None:
+    config = RiotApiConfig(base_url="https://localhost:2999")
+    client = RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+    assert client.state == LifecycleState.IDLE
+
+
+def test_riot_client_accepts_ipv6_loopback_base_url() -> None:
+    config = RiotApiConfig(base_url="https://[::1]:2999")
+    client = RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+    assert client.state == LifecycleState.IDLE
+
+
+def test_riot_client_rejects_non_loopback_hostname() -> None:
+    """If a misconfigured or tampered config.yaml points base_url at a
+    non-loopback host, the client must refuse to construct. Otherwise
+    verify=False silently accepts any cert for that host and the coach
+    becomes an MITM-able screen-capture exfil vector.
+    """
+    config = RiotApiConfig(base_url="https://evil.example.com:2999")
+    with pytest.raises(ValueError, match="loopback"):
+        RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+
+
+def test_riot_client_rejects_public_ip_address() -> None:
+    config = RiotApiConfig(base_url="https://203.0.113.1:2999")
+    with pytest.raises(ValueError, match="loopback"):
+        RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+
+
+def test_riot_client_rejects_missing_host() -> None:
+    """A base_url with no hostname at all is a config error."""
+    config = RiotApiConfig(base_url="not-a-url")
+    with pytest.raises(ValueError, match="base_url"):
+        RiotClient(config=config, callbacks=_CallbackSpy().as_callbacks())
+
+
+# ---------------------------------------------------------------------------
+# F5 regression: on_role_mismatch fires exactly once per game
+# ---------------------------------------------------------------------------
+def _make_top_lane_fixture() -> dict:
+    """Helper: return the ingame fixture with the active player's role
+    changed to TOP (and summoner spells replaced so the Smite fallback
+    doesn't rescue it).
+    """
+    data = _load_fixture("allgamedata_ingame.json")
+    for p in data["allPlayers"]:
+        if p["summonerName"] == data["activePlayer"]["summonerName"]:
+            p["position"] = "TOP"
+            p["summonerSpells"]["summonerSpellOne"]["displayName"] = "Teleport"
+            p["summonerSpells"]["summonerSpellTwo"]["displayName"] = "Flash"
+            break
+    return data
+
+
+def test_role_mismatch_fires_exactly_once_across_repeat_polls() -> None:
+    """Plan line 460 explicitly requires 'fires exactly once'. Before the
+    sticky flag, every 2s poll while stuck in IDLE after a role mismatch
+    re-entered _start_game and re-fired on_role_mismatch. In Phase 2
+    that would be audible TTS spam every 2s for the entire game.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data = _make_top_lane_fixture()
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()  # first mismatch
+        client.poll_once()  # repeat 1 — must NOT fire
+        client.poll_once()  # repeat 2
+        client.poll_once()  # repeat 3
+
+    assert spy.role_mismatches == ["TOP"], (
+        f"on_role_mismatch must fire exactly once across repeat polls, "
+        f"got {spy.role_mismatches}"
+    )
+    assert client.state == LifecycleState.IDLE
+
+
+def test_role_mismatch_resets_after_no_response_timeout() -> None:
+    """A 10s no-response window while paused on a role mismatch means
+    the game ended (or the user alt-tabbed to the lobby). Clear the
+    sticky memory so the next 200 re-evaluates as a fresh game.
+
+    Discriminating assertion: before the 10s 404, a repeat poll must NOT
+    fire on_role_mismatch (sticky blocks it). After the 10s 404, a fresh
+    poll MUST fire it again (memory cleared). Without both assertions the
+    test would pass vacuously against the current buggy implementation.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data = _make_top_lane_fixture()
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()  # fires TOP
+        client.poll_once()  # sticky — must NOT re-fire
+    # The discriminator: broken code gets ["TOP", "TOP"] here; fix gets ["TOP"].
+    assert spy.role_mismatches == ["TOP"]
+
+    # Simulate 12s of 404 (game ended from client view).
+    base = client._now()
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, status_code=404)
+        client._clock_override = lambda: base + 0.5
+        client.poll_once()
+        client._clock_override = lambda: base + 12.0
+        client.poll_once()
+    client._clock_override = None
+
+    # The user's next game is also top lane — should fire AGAIN for the
+    # new game (the memory cleared after the no-response window).
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()
+
+    assert spy.role_mismatches == ["TOP", "TOP"], (
+        f"after 10s no-response, next game's role mismatch should fire "
+        f"fresh; got {spy.role_mismatches}"
+    )
+
+
+def test_role_mismatch_does_not_reset_on_brief_404() -> None:
+    """A single 404 within the no-response window (transient network
+    blip) should NOT clear the sticky flag. Only after the 10s
+    threshold elapses does the flag clear.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data = _make_top_lane_fixture()
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()
+    assert spy.role_mismatches == ["TOP"]
+
+    # 5s of 404 — under the 10s threshold.
+    base = client._now()
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, status_code=404)
+        client._clock_override = lambda: base + 0.5
+        client.poll_once()
+        client._clock_override = lambda: base + 5.0
+        client.poll_once()
+    client._clock_override = None
+
+    # Next 200 with same mismatch should NOT re-fire the callback.
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data)
+        client.poll_once()
+
+    assert spy.role_mismatches == ["TOP"], (
+        f"sticky flag must survive a brief 404 window, got {spy.role_mismatches}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F14 regression: malformed 200 payload must not cycle the FSM
+# ---------------------------------------------------------------------------
+def _malformed_payload_no_active_player() -> dict:
+    """200 response with no activePlayer field at all."""
+    return {
+        "allPlayers": [],
+        "events": {"Events": []},
+        "gameData": {
+            "gameMode": "CLASSIC",
+            "gameTime": 10.5,
+            "mapName": "Map11",
+            "mapNumber": 11,
+        },
+    }
+
+
+def test_malformed_payload_missing_active_player_does_not_cycle_fsm() -> None:
+    """A 200 response that lacks an activePlayer entry (schema drift or
+    mid-transition glitch) must NOT transition through STARTING on every
+    poll. F14 from /ce:review: the old FSM cycled IDLE → STARTING → IDLE
+    per poll, spamming on_state_change callbacks and rotating the JSONL
+    log repeatedly — the root cause of F9's ~900-files-per-30-minutes
+    scenario when a bad payload storm hits.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=_malformed_payload_no_active_player())
+        client.poll_once()
+        client.poll_once()
+        client.poll_once()
+        client.poll_once()
+
+    assert client.state == LifecycleState.IDLE
+    assert all(t != LifecycleState.STARTING for (_, t, _) in spy.state_changes), (
+        f"malformed payloads must not cycle through STARTING; "
+        f"got {[(f.value, t.value) for (f, t, _) in spy.state_changes]}"
+    )
+    # No callbacks should have fired for game_data or role_mismatch.
+    assert spy.game_data_calls == []
+    assert spy.role_mismatches == []
+
+
+def test_malformed_payload_warns_only_once_across_repeat_polls(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The malformed-payload warning must be throttled — logging on every
+    2s poll would flood the logs for a stuck session. Only the first
+    malformed poll in a run warns; the flag resets on the next valid
+    payload.
+    """
+    import logging as _logging
+
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    bad = _malformed_payload_no_active_player()
+
+    with rm_module.Mocker() as m, caplog.at_level(
+        _logging.WARNING, logger="lolcoach.riot_client"
+    ):
+        m.get(ALLGAMEDATA_URL, json=bad)
+        client.poll_once()
+        client.poll_once()
+        client.poll_once()
+
+    malformed_warnings = [
+        r for r in caplog.records
+        if "malformed" in r.message.lower() or "activeplayer" in r.message.lower()
+    ]
+    assert len(malformed_warnings) == 1, (
+        f"expected exactly 1 malformed-payload warning, "
+        f"got {len(malformed_warnings)}: "
+        f"{[r.message for r in malformed_warnings]}"
+    )
+
+
+def test_malformed_then_valid_payload_transitions_normally() -> None:
+    """After a run of malformed payloads, a valid one should cleanly
+    transition IDLE → STARTING → ACTIVE. The throttle flag resets on
+    valid input so the next malformed run would warn again.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=_malformed_payload_no_active_player())
+        client.poll_once()
+        client.poll_once()
+    assert client.state == LifecycleState.IDLE
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=_load_fixture("allgamedata_ingame.json"))
+        client.poll_once()
+
+    assert client.state == LifecycleState.ACTIVE
+    # Exactly one STARTING → ACTIVE transition (the successful poll),
+    # not one per prior bad poll.
+    active_transitions = [
+        (f, t) for (f, t, _) in spy.state_changes if t == LifecycleState.ACTIVE
+    ]
+    assert len(active_transitions) == 1
+
+
+def test_malformed_payload_with_missing_all_players_is_handled() -> None:
+    """Variant: the payload has an activePlayer but no allPlayers list
+    to resolve it against. Still a malformed case.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    bad = {
+        "activePlayer": {"summonerName": "Ghost#NA1", "level": 1},
+        # Deliberately no allPlayers key
+        "events": {"Events": []},
+        "gameData": {"gameMode": "CLASSIC", "gameTime": 0.0, "mapName": "Map11"},
+    }
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=bad)
+        client.poll_once()
+        client.poll_once()
+
+    assert client.state == LifecycleState.IDLE
+    assert all(t != LifecycleState.STARTING for (_, t, _) in spy.state_changes)
+
+
+def test_malformed_payload_active_player_not_in_all_players() -> None:
+    """Variant: activePlayer.summonerName exists but doesn't match any
+    entry in allPlayers (mid-transition glitch where the arrays haven't
+    synchronized yet). Same handling — treat as no-response.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    bad = {
+        "activePlayer": {"summonerName": "Mismatch#NA1", "level": 1},
+        "allPlayers": [
+            {
+                "summonerName": "Ally1#NA1",
+                "championName": "Jinx",
+                "position": "BOTTOM",
+                "team": "ORDER",
+                "summonerSpells": {
+                    "summonerSpellOne": {"displayName": "Flash"},
+                    "summonerSpellTwo": {"displayName": "Heal"},
+                },
+            }
+        ],
+        "events": {"Events": []},
+        "gameData": {"gameMode": "CLASSIC", "gameTime": 0.0, "mapName": "Map11"},
+    }
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=bad)
+        client.poll_once()
+        client.poll_once()
+
+    assert client.state == LifecycleState.IDLE
+    assert all(t != LifecycleState.STARTING for (_, t, _) in spy.state_changes)
+
+
+def test_malformed_payload_during_active_eventually_triggers_ending() -> None:
+    """If the coach is ACTIVE and Riot starts returning malformed 200
+    payloads, the accumulated no-response time should eventually
+    trigger the ENDING transition — same as a 404 storm. This is the
+    graceful-degradation path: bad data is worse than no data, and the
+    user's game either really ended or Riot's client crashed.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+
+    # Drive into ACTIVE first with a valid payload.
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=_load_fixture("allgamedata_ingame.json"))
+        client.poll_once()
+    assert client.state == LifecycleState.ACTIVE
+
+    # Now Riot returns malformed payloads for 12s (past the 10s threshold).
+    base = client._now()
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=_malformed_payload_no_active_player())
+        client._clock_override = lambda: base + 0.5
+        client.poll_once()
+        client._clock_override = lambda: base + 12.0
+        client.poll_once()
+    client._clock_override = None
+
+    assert client.state == LifecycleState.IDLE
+    assert spy.game_ends == ["timeout"]
+
+
+def test_role_mismatch_memory_tracks_summoner_not_just_a_boolean() -> None:
+    """If the active player changes (e.g., a different user logs in on
+    the same machine, or a test harness injects a different player), the
+    sticky memory must re-evaluate rather than short-circuit based on an
+    unrelated stale state.
+    """
+    spy = _CallbackSpy()
+    client = _make_client(spy.as_callbacks())
+    data_a = _make_top_lane_fixture()  # ActivePlayer#NA1 playing TOP
+
+    # Build a "different user" fixture: swap the active player's summoner
+    # name to DifferentUser#NA1 and also update the matching entry.
+    data_b = _make_top_lane_fixture()
+    data_b["activePlayer"]["summonerName"] = "DifferentUser#NA1"
+    for p in data_b["allPlayers"]:
+        if p["summonerName"] == "ActivePlayer#NA1":
+            p["summonerName"] = "DifferentUser#NA1"
+            break
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data_a)
+        client.poll_once()  # fires TOP for ActivePlayer#NA1
+    assert spy.role_mismatches == ["TOP"]
+
+    with rm_module.Mocker() as m:
+        m.get(ALLGAMEDATA_URL, json=data_b)
+        client.poll_once()  # different summoner — should fire fresh
+
+    assert spy.role_mismatches == ["TOP", "TOP"], (
+        f"different active player should re-evaluate, "
+        f"got {spy.role_mismatches}"
+    )

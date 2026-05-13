@@ -25,6 +25,8 @@ from typing import Any
 
 import numpy as np
 
+from lolcoach.detector import DetectionResult
+
 # dxcam is Windows-only. Import lazily so the module is usable on macOS/Linux
 # for unit tests that inject a fake camera.
 if sys.platform == "win32":  # pragma: no cover - Windows-only import path
@@ -64,6 +66,15 @@ class ROI:
 
     def as_tuple(self) -> tuple[int, int, int, int]:
         return (self.x, self.y, self.w, self.h)
+
+
+@dataclass(frozen=True)
+class FramePacket:
+    """A captured minimap frame paired with detections from that same frame."""
+
+    frame: np.ndarray
+    detections: DetectionResult
+    captured_at: float
 
 
 # ---------------------------------------------------------------------------
@@ -126,21 +137,21 @@ class LatestFrameBuffer:
     """
 
     def __init__(self) -> None:
-        self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=1)
 
-    def put_latest(self, frame: np.ndarray) -> None:
-        """Drain any pending frame, then put *frame*. Never blocks."""
+    def put_latest(self, item: Any) -> None:
+        """Drain any pending item, then put *item*. Never blocks."""
         try:
             self._queue.get_nowait()
         except queue.Empty:
             pass
         try:
-            self._queue.put_nowait(frame)
+            self._queue.put_nowait(item)
         except queue.Full:  # pragma: no cover - defensive; drain+put is atomic enough
             pass
 
-    def get(self, timeout: float | None = None) -> np.ndarray | None:
-        """Block for *timeout* seconds waiting for a frame. Return None on timeout."""
+    def get(self, timeout: float | None = None) -> Any | None:
+        """Block for *timeout* seconds waiting for an item. Return None on timeout."""
         try:
             return self._queue.get(timeout=timeout)
         except queue.Empty:

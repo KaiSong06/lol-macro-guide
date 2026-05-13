@@ -27,6 +27,7 @@ otherwise every poll would log a noisy warning.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import threading
 import time
@@ -34,6 +35,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import urllib3
@@ -127,6 +129,42 @@ def _extract_role(player: dict[str, Any]) -> str:
     return pos or "UNKNOWN"
 
 
+def _assert_loopback_base_url(base_url: str) -> None:
+    """Reject any ``base_url`` whose host is not a loopback address.
+
+    The client ships with ``verify=False`` because the Live Client Data API
+    runs on a self-signed localhost certificate. That bypass is only safe
+    when the target is the loopback interface — an attacker who can tamper
+    with ``config.yaml`` could otherwise point ``base_url`` at a remote
+    host and silently exfiltrate summoner names over an unverified TLS
+    connection. This check enforces the loopback invariant at construction
+    time so the failure mode is impossible, not merely discouraged.
+    """
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    if not host:
+        raise ValueError(
+            f"RiotClient base_url must have a hostname; got {base_url!r}"
+        )
+    # Accept the literal ``localhost`` alias even though it resolves at
+    # runtime — DNS resolution against /etc/hosts's localhost entry is
+    # effectively loopback for any sane system.
+    if host.lower() == "localhost":
+        return
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError(
+            f"RiotClient base_url host must be an IP address or 'localhost' "
+            f"(got {host!r}); verify=False TLS bypass is scoped to loopback only"
+        ) from exc
+    if not ip.is_loopback:
+        raise ValueError(
+            f"RiotClient base_url must be a loopback address "
+            f"(got {host!r}); verify=False TLS bypass is scoped to loopback only"
+        )
+
+
 # ---------------------------------------------------------------------------
 # RiotClient
 # ---------------------------------------------------------------------------
@@ -143,6 +181,7 @@ class RiotClient:
         callbacks: Callbacks,
         session: requests.Session | None = None,
     ) -> None:
+        _assert_loopback_base_url(config.base_url)
         self._config = config
         self._callbacks = callbacks
         self._session = session or requests.Session()
@@ -159,6 +198,21 @@ class RiotClient:
         # ``state`` property; this one covers the full read-and-decide
         # block inside a single poll.
         self._poll_lock = threading.Lock()
+
+        # F5: sticky memory of the most recent active player we fired
+        # on_role_mismatch for. While this matches the current active
+        # player's summoner name, repeat polls short-circuit without
+        # re-firing the callback (or even cycling the FSM). Cleared on:
+        #   - ACTIVE → ENDING transition (game actually ended)
+        #   - 10s of no-response while in IDLE (user returned to lobby)
+        #   - A successful jungle-role transition (user changed role)
+        self._role_mismatch_summoner: str | None = None
+
+        # F14: throttle flag for the "malformed payload" warning. Set
+        # when we see a 200 response we can't parse an active player out
+        # of; cleared when a valid payload arrives. Without this, a bad
+        # payload storm would log a warning on every 2s poll.
+        self._malformed_payload_warned: bool = False
 
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -293,19 +347,62 @@ class RiotClient:
         if self._no_response_since is None:
             self._no_response_since = now
         elapsed = now - self._no_response_since
-        if (
-            self._state == LifecycleState.ACTIVE
-            and elapsed >= NO_RESPONSE_ENDING_THRESHOLD_S
-        ):
+        if elapsed < NO_RESPONSE_ENDING_THRESHOLD_S:
+            return
+        if self._state == LifecycleState.ACTIVE:
             self._end_current_game("timeout")
+            return
+        if (
+            self._state == LifecycleState.IDLE
+            and self._role_mismatch_summoner is not None
+        ):
+            # 10s+ of no-response while paused on a role mismatch means the
+            # game ended from the client's view (user returned to lobby or
+            # alt-tabbed away). Clear the memory so the next 200 re-evaluates
+            # fresh. Reset the no-response window so we don't re-trigger on
+            # every subsequent 404.
+            logger.info(
+                "clearing role-mismatch memory after no-response timeout"
+            )
+            self._role_mismatch_summoner = None
+            self._no_response_since = None
 
     def _handle_game_data(self, data: dict[str, Any]) -> None:
-        # Successful 200 clears the no-response window.
+        # F14: pre-validate the payload. A 200 response that we can't
+        # resolve an active player out of (missing activePlayer, missing
+        # allPlayers, summoner name not found) is indistinguishable from
+        # a 404 for our purposes — treat it as no-response so the FSM
+        # doesn't cycle IDLE → STARTING → IDLE on every poll. This also
+        # prevents a malformed payload's gameTime from being mistaken
+        # for a "new game started" reset while in ACTIVE state.
+        if _find_active_player_entry(data) is None:
+            if not self._malformed_payload_warned:
+                logger.warning(
+                    "200 response with missing/malformed activePlayer — "
+                    "treating as no-response until a valid payload arrives"
+                )
+                self._malformed_payload_warned = True
+            self._handle_no_response()
+            return
+
+        # Valid payload — clear the malformed-throttle and the
+        # no-response window.
+        self._malformed_payload_warned = False
         self._no_response_since = None
 
         game_time = self._extract_game_time(data)
 
         if self._state == LifecycleState.IDLE:
+            # F5: if we've already notified about a role mismatch for this
+            # active player, don't re-cycle IDLE → STARTING → IDLE and
+            # don't re-fire the callback. Suppression is keyed on summoner
+            # name so a DIFFERENT active player triggers a fresh evaluation.
+            if self._role_mismatch_summoner is not None:
+                active_summoner = (data.get("activePlayer") or {}).get(
+                    "summonerName"
+                )
+                if active_summoner == self._role_mismatch_summoner:
+                    return
             self._start_game(data, game_time)
             return
 
@@ -339,8 +436,14 @@ class RiotClient:
         if not _is_jungle_role(player):
             role = _extract_role(player)
             self._callbacks.on_role_mismatch(role)
+            # F5: remember which summoner we notified about so repeat polls
+            # for the same game don't re-fire the callback.
+            self._role_mismatch_summoner = player.get("summonerName")
             self._transition(LifecycleState.IDLE, f"role mismatch: {role}")
             return
+        # Valid jungle role — clear any stale role-mismatch memory (user
+        # may have swapped from a mismatch game to a fresh jungle game).
+        self._role_mismatch_summoner = None
         self._last_game_time = game_time
         self._transition(LifecycleState.ACTIVE, "role verified as jungle")
         self._callbacks.on_game_data(data)
@@ -350,6 +453,11 @@ class RiotClient:
         self._callbacks.on_game_end(reason)
         self._last_game_time = None
         self._no_response_since = None
+        # Defensive: if the sticky role-mismatch memory was somehow set
+        # while in ACTIVE, clear it on game end. Normal flow never sets
+        # the flag while in ACTIVE, but this guarantees new games get a
+        # fresh evaluation regardless of how we reached ENDING.
+        self._role_mismatch_summoner = None
         self._transition(LifecycleState.IDLE, "cleanup complete")
 
     @staticmethod
