@@ -26,6 +26,8 @@ decisions:
 
 tts:
   voice: en_US-amy-medium
+  piper_path: auto  # or an explicit path to piper.exe
+  voice_dir: auto  # or an explicit directory containing <voice>.onnx
   speed: 1.0
   output_device: system_default  # or a specific device name
   interrupt_confidence_delta: 2  # new callout needs this much higher confidence to interrupt

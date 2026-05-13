@@ -54,6 +54,8 @@ decisions:
 
 tts:
   voice: en_US-lessac-medium
+  piper_path: C:/tools/piper/piper.exe
+  voice_dir: C:/tools/piper/voices
   speed: 1.1
   output_device: "Headphones (USB Audio)"
   interrupt_confidence_delta: 3
@@ -80,6 +82,8 @@ logging:
     assert cfg.decisions.dedup_window_seconds == 25
     assert cfg.decisions.staleness_threshold_seconds == 8
     assert cfg.tts.voice == "en_US-lessac-medium"
+    assert cfg.tts.piper_path == "C:/tools/piper/piper.exe"
+    assert cfg.tts.voice_dir == "C:/tools/piper/voices"
     assert cfg.tts.speed == pytest.approx(1.1)
     assert cfg.tts.output_device == "Headphones (USB Audio)"
     assert cfg.tts.interrupt_confidence_delta == 3

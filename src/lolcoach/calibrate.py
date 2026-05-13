@@ -111,11 +111,36 @@ def _run_interactive() -> ROI | None:  # pragma: no cover - hardware-dependent
     Windows-only in practice — requires dxcam + a display. Documented in
     ``tests/manual.md`` and smoke-tested on real hardware in Unit 10.
     """
-    raise NotImplementedError(
-        "Interactive calibration lands with the real dxcam integration — "
-        "pass --corners x1,y1,x2,y2 for scripted mode, or run on a "
-        "Windows machine with dxcam."
-    )
+    if sys.platform != "win32":
+        return None
+
+    import cv2
+    import dxcam
+
+    camera = dxcam.create()
+    frame = camera.grab()
+    if frame is None:
+        return None
+
+    clicks: list[tuple[int, int]] = []
+    window_name = "lolcoach minimap calibration"
+
+    def on_mouse(event: int, x: int, y: int, _flags: int, _param: object) -> None:
+        if event != cv2.EVENT_LBUTTONDOWN:
+            return
+        clicks.append((x, y))
+        cv2.circle(frame, (x, y), 5, (0, 255, 0), thickness=-1)
+
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(window_name, on_mouse)
+    while len(clicks) < 2:
+        cv2.imshow(window_name, frame)
+        key = cv2.waitKey(50) & 0xFF
+        if key in (27, ord("q")):
+            cv2.destroyWindow(window_name)
+            return None
+    cv2.destroyWindow(window_name)
+    return compute_roi(clicks[0], clicks[1])
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -138,15 +163,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote calibration to {args.output}: {roi}")
         return 0
 
-    # Interactive path: requires Windows + a display. Refuse cleanly here so
-    # test runners and CI don't crash trying to pop a window.
-    print(
-        "Interactive calibration is Windows-only for now. "
-        "Pass --corners x1,y1,x2,y2 for scripted calibration, or run this "
-        "command on a Windows machine with dxcam installed.",
-        file=sys.stderr,
-    )
-    return 1
+    roi = _run_interactive()
+    if roi is None:
+        print(
+            "Interactive calibration requires Windows with dxcam and a display. "
+            "Pass --corners x1,y1,x2,y2 for scripted calibration.",
+            file=sys.stderr,
+        )
+        return 1
+    save_calibration(args.output, roi)
+    print(f"Wrote calibration to {args.output}: {roi}")
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry

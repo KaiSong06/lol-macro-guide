@@ -66,6 +66,8 @@ class DecisionsConfig:
 @dataclass(frozen=True)
 class TtsConfig:
     voice: str = "en_US-amy-medium"
+    piper_path: str = "auto"
+    voice_dir: str = "auto"
     speed: float = 1.0
     output_device: str = "system_default"
     interrupt_confidence_delta: int = 2

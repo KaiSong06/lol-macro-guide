@@ -105,9 +105,23 @@ def test_update_from_riot_non_numeric_currentgold_keeps_field_none() -> None:
 
 
 def test_update_from_detector_sets_enemy_jungler_last_seen() -> None:
+    """``update_from_detector`` stores last_seen as
+    ``(quadrant, game_time_seconds)`` — the game-clock at the moment of
+    the state update, NOT the wall-clock ``detected_at`` from the
+    DetectionResult. This is the fix for the R6 precondition bug where
+    the prompt builder computed age as ``game_time_seconds - wall_clock_ts``
+    and silently clamped every callout's "~Ns ago" to ~0s.
+
+    The ``detected_at`` field on DetectionResult remains wall-clock for
+    other consumers (capture→inference staleness tracking, log records);
+    only the state manager's *stored* last_seen has shifted base.
+    """
     sm = StateManager()
     data = _load_fixture("allgamedata_ingame.json")
     sm.update_from_riot(data)
+    # Fixture sets game_time to 742.5s — that's what last_seen should
+    # carry, not the detector's wall-clock detected_at below.
+    assert sm.snapshot().game_time_seconds == 742.5
 
     detection = DetectionResult(
         champions=(
@@ -119,7 +133,7 @@ def test_update_from_detector_sets_enemy_jungler_last_seen() -> None:
                 confidence=0.91,
             ),
         ),
-        detected_at=1712750000.0,
+        detected_at=1712750000.0,  # wall-clock — intentionally ignored
     )
     sm.update_from_detector(detection)
 
@@ -127,7 +141,9 @@ def test_update_from_detector_sets_enemy_jungler_last_seen() -> None:
     assert snap.enemy_jungler_last_seen is not None
     quad, ts = snap.enemy_jungler_last_seen
     assert quad == "bot_jungle"
-    assert ts == 1712750000.0
+    # Game-clock, matching game_time_seconds at the moment of
+    # update_from_detector — NOT the DetectionResult.detected_at.
+    assert ts == 742.5
 
 
 def test_snapshot_is_independent_of_stored_state() -> None:
@@ -389,13 +405,13 @@ def test_snapshot_predicted_quadrant_is_none_at_cold_start() -> None:
 
 
 def test_snapshot_predicted_quadrant_after_detection() -> None:
-    import time as _time
-
     sm = StateManager()
     sm.update_from_riot(_load_fixture("allgamedata_ingame.json"))
-    # detected_at must be close to the current wall clock so that snapshot's
-    # ``time.time() - ts`` is small (under 30s) and predict_quadrant returns
-    # the last-seen quadrant unchanged.
+    # update_from_detector now stores (quadrant, game_time_seconds) —
+    # wall-clock detected_at is ignored for the last_seen storage path.
+    # game_time_seconds just got set to 742.5 by the Riot update above,
+    # so snapshot's elapsed = 742.5 - 742.5 = 0s → predict_quadrant
+    # returns the last-seen quadrant unchanged.
     sm.update_from_detector(
         DetectionResult(
             champions=(
@@ -407,7 +423,7 @@ def test_snapshot_predicted_quadrant_after_detection() -> None:
                     confidence=0.9,
                 ),
             ),
-            detected_at=_time.time() - 5.0,  # 5 seconds ago
+            detected_at=0.0,  # ignored by update_from_detector; kept for DetectionResult contract
         )
     )
     snap = sm.snapshot()

@@ -26,6 +26,8 @@ dependencies = [
     "urllib3>=2.2",
     "PyYAML>=6.0",
     "dxcam>=0.0.5; sys_platform == 'win32'",
+    "sounddevice>=0.5; sys_platform == 'win32'",
+    "PySide6>=6.7; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +38,8 @@ dev = [
     "pytest-cov>=5.0",
     "requests-mock>=1.12",
     "ruff>=0.6",
+    "pyinstaller>=6.0; sys_platform == 'win32'",
+    "pytest-qt>=4.4; sys_platform == 'win32'",
 ]
 
 [project.scripts]
@@ -52,6 +56,7 @@ pythonpath = ["src"]
 [tool.coverage.run]
 source = ["src/lolcoach"]
 branch = true
+omit = ["src/lolcoach/ui/*"]
 
 [tool.coverage.report]
 exclude_lines = [

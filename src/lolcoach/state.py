@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -66,6 +65,13 @@ class GameState:
     all_champions: frozenset[str] = frozenset()
     enemy_jungler_champion_name: str | None = None
     enemy_jungler_summoner_name: str | None = None
+    #: Last confirmed sighting of the enemy jungler as
+    #: ``(quadrant_name, game_time_seconds_at_detection)``. ``None`` until
+    #: the first detector hit — the cold-start rule (R6 precondition)
+    #: says the prompt builder must OMIT the "Enemy jungler" line entirely
+    #: in that case, never substitute a guess. The timestamp half is in
+    #: **game-clock** seconds (not wall-clock), so ``state.game_time_seconds
+    #: - ts`` gives a correct "~Ns ago" delta for the user prompt.
     enemy_jungler_last_seen: tuple[str, float] | None = None
     enemy_jungler_predicted_quadrant: str | None = None
     kill_feed: tuple[dict[str, Any], ...] = ()
@@ -201,6 +207,23 @@ class StateManager:
         Only fires when the detector saw a champion whose name matches the
         identified enemy jungler. Empty-detection frames do not clobber
         the last-seen value.
+
+        The stored timestamp uses **game-clock** (``self._game_time_seconds``)
+        rather than wall-clock (``result.detected_at``). Every downstream
+        consumer — snapshot's ``predict_quadrant`` call AND
+        :func:`lolcoach.prompts.build_user_prompt`'s age computation — needs
+        to compute "how much game-time has elapsed since last-seen", and
+        mixing wall-clock and game-clock produced a silent ~0s ago clamp
+        in production that defeated the whole purpose of telling the LLM
+        how stale the sighting is. Using game-clock everywhere makes the
+        "age" field mean what it says.
+
+        The trade-off: ``self._game_time_seconds`` is refreshed by Riot
+        polling every ~2s, so the stored game-clock can lag the true
+        detection moment by up to the Riot poll interval. That's inside
+        jungle coaching granularity ("~30s ago" vs "~32s ago" is the same
+        coaching decision) and the wall-clock alternative silently clamped
+        everything to 0s, which was much worse.
         """
         with self._lock:
             enemy_jungler_champ = self._enemy_jungler_champion_name
@@ -208,7 +231,10 @@ class StateManager:
                 return
             for champ in result.champions:
                 if champ.team == "enemy" and champ.name == enemy_jungler_champ:
-                    self._enemy_jungler_last_seen = (champ.quadrant, result.detected_at)
+                    self._enemy_jungler_last_seen = (
+                        champ.quadrant,
+                        self._game_time_seconds,
+                    )
                     return
 
     def record_kill(self, event: dict[str, Any]) -> None:
@@ -241,11 +267,18 @@ class StateManager:
         """
         with self._lock:
             # Compute the predicted quadrant at snapshot time so it reflects
-            # the latest game time.
+            # the latest game time. ``last_seen`` is stored in game-clock
+            # by ``update_from_detector``, and ``_game_time_seconds`` is
+            # game-clock, so the subtraction is in consistent units. During
+            # active play the game clock advances at real-time rate, so
+            # ``predict_quadrant`` still receives real-world elapsed
+            # seconds (which is what the jungle-path timings assume).
+            # During a pause, game_time freezes and "elapsed" correctly
+            # stops advancing — the enemy jungler isn't actually moving.
             predicted = None
             if self._enemy_jungler_last_seen is not None:
                 quad, ts = self._enemy_jungler_last_seen
-                elapsed = max(0.0, time.time() - ts)
+                elapsed = max(0.0, self._game_time_seconds - ts)
                 predicted = predict_quadrant(quad, elapsed)
 
             return GameState(
